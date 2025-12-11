@@ -1,7 +1,7 @@
 import streamlit as st
 from google import genai
 from google.genai import types
-from io import BytesIO
+from io import BytesIO, StringIO
 from PIL import Image
 import json
 import time
@@ -10,15 +10,16 @@ import base64
 import csv
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Loneliness Workshop: AI Experiment", layout="wide")
+st.set_page_config(page_title="Engineering loneliness", layout="wide")
 HOST_PASSWORD = "admin123" 
 
 # --- DATABASE FUNCTIONS ---
 
 def init_db():
-    """Ensures the table exists. Using v3 to force a fresh start for this update."""
+    """Ensures the table exists."""
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
+        # Using v3 to match previous schema
         c.execute('''CREATE TABLE IF NOT EXISTS gallery_v3
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       team_name TEXT,
@@ -43,7 +44,6 @@ def blob_to_image(blob):
     return Image.open(BytesIO(blob))
 
 def save_submission(team, prompt, img_obj):
-    """Saves the Team Name, The PROMPT text, and the Image."""
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
         img_blob = image_to_blob(img_obj)
@@ -98,26 +98,32 @@ def reset_db():
         c.execute("DELETE FROM gallery_v3")
         conn.commit()
 
-# --- HOST DATA EXPORT ---
+# --- HOST DATA EXPORT (FIXED) ---
 def convert_db_to_csv():
-    """Helper to download all collected data."""
+    """Helper to download all collected data using StringIO."""
     submissions = get_all_submissions()
-    output = BytesIO()
-    writer = csv.writer(output.decode('utf-8'))
     
-    # Header
-    csv_data = "Team Name,Prompt,Human Average Score,Vote Count,AI Score,AI Reasoning\n"
+    # Use StringIO to create a string buffer for CSV data
+    output = StringIO()
+    writer = csv.writer(output)
     
+    # Write Header
+    writer.writerow(["Team Name", "Prompt", "Human Average Score", "Vote Count", "AI Score", "AI Reasoning"])
+    
+    # Write Rows
     for s in submissions:
-        # Clean text to avoid CSV breaking
-        clean_prompt = s['prompt'].replace('"', "'").replace('\n', ' ')
-        clean_reason = s['ai_reasoning'].replace('"', "'").replace('\n', ' ') if s['ai_reasoning'] else ""
-        row = f'"{s["team"]}","{clean_prompt}",{s["human_score"]},{s["vote_count"]},{s["ai_score"]},"{clean_reason}"\n'
-        csv_data += row
+        writer.writerow([
+            s['team'], 
+            s['prompt'], 
+            s['human_score'], 
+            s['vote_count'], 
+            s['ai_score'], 
+            s['ai_reasoning']
+        ])
         
-    return csv_data
+    return output.getvalue()
 
-# --- ROBUST AI CLIENT (Retries & Error Handling) ---
+# --- ROBUST AI CLIENT ---
 def retry_api_call(func, retries=3, delay=2):
     for attempt in range(retries):
         try:
@@ -218,6 +224,10 @@ with st.sidebar:
 # --- MAIN APP ---
 st.title(f"🧩 Loneliness Experiment | {app_mode_prefix}{app_mode}")
 
+# Initialize session state for tracking user votes
+if 'voted_ids' not in st.session_state:
+    st.session_state['voted_ids'] = set()
+
 # === PHASE 1: CREATE ===
 if app_mode == "1. Create" and not is_host:
     if 'current_draft' not in st.session_state: st.session_state['current_draft'] = None
@@ -271,11 +281,19 @@ elif app_mode == "2. Gallery & Vote" or app_mode == "View Gallery":
                 # Voting
                 st.caption(f"Avg Score: **{int(item['human_score'])}** ({item['vote_count']} votes)")
                 
-                vote_val = st.slider("Rate Loneliness", 0, 100, 50, key=f"s_{item['id']}")
-                if st.button(f"Submit Vote (#{item['id']})", key=f"b_{item['id']}"):
+                # Check if user already voted
+                has_voted = item['id'] in st.session_state['voted_ids']
+                
+                vote_val = st.slider("Rate Loneliness", 0, 100, 50, key=f"s_{item['id']}", disabled=has_voted)
+                
+                # Button Logic
+                btn_label = "✅ Vote Submitted" if has_voted else f"Submit Vote (#{item['id']})"
+                
+                if st.button(btn_label, key=f"b_{item['id']}", disabled=has_voted):
                     submit_human_vote(item['id'], vote_val)
+                    st.session_state['voted_ids'].add(item['id'])
                     st.success("Vote Added!")
-                    time.sleep(1)
+                    time.sleep(0.5)
                     st.rerun()
 
                 if item['ai_score']:
