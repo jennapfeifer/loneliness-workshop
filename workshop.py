@@ -9,8 +9,8 @@ import sqlite3
 import base64
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Reverse engineering loneliness", layout="wide")
-HOST_PASSWORD = "admin123"  # Change this password for the host
+st.set_page_config(page_title="Loneliness Workshop: AI Experiment", layout="wide")
+HOST_PASSWORD = "admin123"  # Change this password if you want
 
 # --- DATABASE FUNCTIONS (SQLite for Shared State) ---
 def init_db():
@@ -147,9 +147,11 @@ with st.sidebar:
     # API Key
     api_key = None
     try:
+        # Try to get key from Streamlit secrets (Cloud)
         api_key = st.secrets["google_api"]["key"]
-    except KeyError:
-        st.warning("Secrets file not found.")
+    except Exception:
+        # Fallback to manual entry (Local testing)
+        st.warning("Secrets not found. Using manual entry.")
         api_key = st.text_input("Enter Google API Key", type="password")
     
     client = None
@@ -209,8 +211,6 @@ if app_mode == "1. Create & Submit" and not is_host:
         draft_prompt = st.text_area("Describe the image of loneliness:", height=150, 
             placeholder="A single, small figure sitting on a bench facing a dense fog...")
         
-        # We are sticking to prompt editing. True image inpainting via API is too complex 
-        # for this setup and prone to errors without specialized models.
         generate_btn = st.button("Generate Draft Image", type="primary", disabled=not client)
         
         if generate_btn and client and draft_prompt:
@@ -273,8 +273,6 @@ elif app_mode == "2. View Gallery & Vote" or app_mode == "View Gallery & Votes":
                 )
                 if new_score != item['human_score']:
                      update_human_score(item['id'], new_score)
-                     # Rerun to reflect change immediately in UI state if needed, 
-                     # though slider UI usually handles it.
 
                 if item['ai_score']:
                      st.success(f"**AI Final Score: {item['ai_score']}**")
@@ -297,9 +295,6 @@ elif app_mode == "Run AI Analysis" and is_host:
             status_text = st.empty()
             
             for i, item in enumerate(submissions):
-                # Optional: skip if already analyzed to save time
-                # if item['ai_score'] is not None: continue 
-
                 status_text.write(f"Analyzing Image ID {item['id']} by Team '{item['team']}'...")
                 analysis_result = analyze_loneliness_literature(client, item['image'])
                 update_ai_results(item['id'], analysis_result)
