@@ -24,8 +24,8 @@ def init_db():
                       prompt TEXT,
                       image_blob BLOB,
                       vote_count INTEGER DEFAULT 0,
-                      sum_valence INTEGER DEFAULT 0,  -- Peace vs Pain
-                      sum_density INTEGER DEFAULT 0,  -- Void vs Crowd
+                      sum_valence INTEGER DEFAULT 0,
+                      sum_density INTEGER DEFAULT 0,
                       avg_valence REAL DEFAULT 0,
                       avg_density REAL DEFAULT 0,
                       ai_valence INTEGER DEFAULT 0,
@@ -202,29 +202,36 @@ with st.sidebar:
 st.title(f"🧩 The Texture of Loneliness")
 if 'voted_ids' not in st.session_state: st.session_state['voted_ids'] = set()
 
-# === PHASE 1: CREATE (NOW FIXED WITH FORM) ===
+# === PHASE 1: CREATE (UPDATED: ALWAYS CLICKABLE) ===
 if app_mode == "1. Create" and not is_host:
     if 'current_draft' not in st.session_state: st.session_state['current_draft'] = None
     st.markdown("Create an image. Is it a **Crowded** loneliness or an **Empty** one?")
     
     col1, col2 = st.columns([1, 1])
     with col1:
-        # --- NEW: FORM WRAPPER FOR GENERATION ---
+        # Form helps with lag
         with st.form("generation_form"):
             draft_prompt = st.text_area("Prompt:", height=150)
-            generate_clicked = st.form_submit_button("Generate Draft", type="primary", disabled=not client)
+            # REMOVED the 'disabled' rule. It is now always clickable.
+            generate_clicked = st.form_submit_button("Generate Draft", type="primary")
             
-            if generate_clicked and client:
-                with st.spinner("Dreaming..."):
-                    img = generate_image(client, draft_prompt)
-                    if img: 
-                        st.session_state['current_draft'] = {'image': img, 'prompt': draft_prompt}
+    # Logic moved outside form to handle errors gracefully
+    if generate_clicked:
+        if not client:
+            st.error("⚠️ AI Connection Failed. Please check the API Key in Sidebar.")
+        elif not draft_prompt:
+            st.warning("Please type a description first.")
+        else:
+            with st.spinner("Dreaming..."):
+                img = generate_image(client, draft_prompt)
+                if img: 
+                    st.session_state['current_draft'] = {'image': img, 'prompt': draft_prompt}
+                    st.rerun()
 
     with col2:
         if st.session_state['current_draft']:
             st.image(st.session_state['current_draft']['image'], caption="Draft", use_container_width=True)
             c1, c2 = st.columns(2)
-            # Forms are not needed for simple logic buttons, but good for heavy inputs
             if c1.button("♻️ Edit"): 
                 st.session_state['current_draft'] = None
                 st.rerun()
@@ -235,7 +242,7 @@ if app_mode == "1. Create" and not is_host:
                 time.sleep(1)
                 st.rerun()
 
-# === PHASE 2: VOTING (ALREADY FIXED WITH FORM) ===
+# === PHASE 2: VOTING ===
 elif app_mode == "2. Gallery & Vote" or app_mode == "View Gallery":
     st.markdown("Where does this image fit on the map?")
     subs = get_all_submissions()
@@ -325,8 +332,5 @@ elif app_mode == "The Map (Cluster View)" and is_host:
                 with st.expander(f"{s['team_name']}"):
                     st.image(s['image']); st.write(s['prompt'])
 
-elif app_mode == "Download Data" and is_host:
-    st.download_button("Download CSV", convert_db_to_csv(), "loneliness_map.csv", "text/csv")
-# === DOWNLOAD ===
 elif app_mode == "Download Data" and is_host:
     st.download_button("Download CSV", convert_db_to_csv(), "loneliness_map.csv", "text/csv")
