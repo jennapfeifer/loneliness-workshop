@@ -14,11 +14,10 @@ import pandas as pd
 st.set_page_config(page_title="Loneliness Workshop: The Map", layout="wide")
 HOST_PASSWORD = "admin123" 
 
-# --- DATABASE FUNCTIONS (V5 Schema for Density/Valence) ---
+# --- DATABASE FUNCTIONS (V5 Schema) ---
 def init_db():
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
-        # V5 Schema: Stores Valence (Peace/Pain) and Density (Void/Crowd)
         c.execute('''CREATE TABLE IF NOT EXISTS gallery_v5
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       team_name TEXT,
@@ -106,11 +105,8 @@ def reset_db():
         c.execute("DELETE FROM gallery_v5")
         conn.commit()
 
-# --- CLUSTERING LOGIC (The 4 Types) ---
+# --- CLUSTERING LOGIC ---
 def get_quadrant(valence, density):
-    # Valence: 0 (Peace) -> 100 (Pain)
-    # Density: 0 (Void) -> 100 (Crowd)
-    
     if valence >= 50 and density >= 50:
         return "Urban Isolation", "🏙️ (Painful Crowd)"
     elif valence >= 50 and density < 50:
@@ -149,17 +145,9 @@ def generate_image(client, prompt):
 def analyze_dimensions(client, image):
     lit_prompt = """
     Analyze this image on these 2 specific scales (0-100).
-    
-    1. Valence (Peace vs Pain): 
-       - 0 = Peaceful, Restorative, Calm, 'Happy Alone'
-       - 100 = Painful, Scary, Depressing, 'Sad Alone'
-       
-    2. Density (Void vs Crowd):
-       - 0 = The Void (Empty space, desert, ocean, single room, vastness)
-       - 100 = The Crowd (City street, party, clutter, chaos, many people)
-    
-    Return STRICTLY JSON:
-    {"valence_score": int, "density_score": int, "reasoning": "string"}
+    1. Valence (Peace vs Pain): 0=Peaceful/Calm, 100=Painful/Scary
+    2. Density (Void vs Crowd): 0=Void/Empty, 100=Crowd/Busy
+    Return STRICTLY JSON: {"valence_score": int, "density_score": int, "reasoning": "string"}
     """
     def _call():
         response = client.models.generate_content(
@@ -214,28 +202,40 @@ with st.sidebar:
 st.title(f"🧩 The Texture of Loneliness")
 if 'voted_ids' not in st.session_state: st.session_state['voted_ids'] = set()
 
-# === PHASE 1: CREATE ===
+# === PHASE 1: CREATE (NOW FIXED WITH FORM) ===
 if app_mode == "1. Create" and not is_host:
     if 'current_draft' not in st.session_state: st.session_state['current_draft'] = None
     st.markdown("Create an image. Is it a **Crowded** loneliness or an **Empty** one?")
     
     col1, col2 = st.columns([1, 1])
     with col1:
-        draft_prompt = st.text_area("Prompt:", height=150)
-        if st.button("Generate Draft", type="primary", disabled=not client):
-            with st.spinner("Dreaming..."):
-                img = generate_image(client, draft_prompt)
-                if img: st.session_state['current_draft'] = {'image': img, 'prompt': draft_prompt}
+        # --- NEW: FORM WRAPPER FOR GENERATION ---
+        with st.form("generation_form"):
+            draft_prompt = st.text_area("Prompt:", height=150)
+            generate_clicked = st.form_submit_button("Generate Draft", type="primary", disabled=not client)
+            
+            if generate_clicked and client:
+                with st.spinner("Dreaming..."):
+                    img = generate_image(client, draft_prompt)
+                    if img: 
+                        st.session_state['current_draft'] = {'image': img, 'prompt': draft_prompt}
+
     with col2:
         if st.session_state['current_draft']:
             st.image(st.session_state['current_draft']['image'], caption="Draft", use_container_width=True)
             c1, c2 = st.columns(2)
-            if c1.button("♻️ Edit"): st.session_state['current_draft'] = None; st.rerun()
+            # Forms are not needed for simple logic buttons, but good for heavy inputs
+            if c1.button("♻️ Edit"): 
+                st.session_state['current_draft'] = None
+                st.rerun()
             if c2.button("✅ Submit"):
                 save_submission(team_name, st.session_state['current_draft']['prompt'], st.session_state['current_draft']['image'])
-                st.session_state['current_draft'] = None; st.success("Submitted!"); time.sleep(1); st.rerun()
+                st.session_state['current_draft'] = None
+                st.success("Submitted!")
+                time.sleep(1)
+                st.rerun()
 
-# === PHASE 2: VOTING ===
+# === PHASE 2: VOTING (ALREADY FIXED WITH FORM) ===
 elif app_mode == "2. Gallery & Vote" or app_mode == "View Gallery":
     st.markdown("Where does this image fit on the map?")
     subs = get_all_submissions()
@@ -250,18 +250,23 @@ elif app_mode == "2. Gallery & Vote" or app_mode == "View Gallery":
                 
                 has_voted = item['id'] in st.session_state['voted_ids']
                 
-                # --- NEW SLIDERS ---
-                st.markdown("**1. Emotional Vibe**")
-                v_val = st.slider("Peaceful (0) ↔ Painful (100)", 0, 100, 50, key=f"v_{item['id']}", disabled=has_voted)
+                with st.form(key=f"vote_form_{item['id']}"):
+                    st.markdown("**1. Emotional Vibe**")
+                    v_val = st.slider("Peaceful (0) ↔ Painful (100)", 0, 100, 50)
+                    
+                    st.markdown("**2. Physical Space**")
+                    v_dens = st.slider("Empty Void (0) ↔ Crowded (100)", 0, 100, 50)
+                    
+                    submitted = st.form_submit_button("Submit Vote", disabled=has_voted)
+                    
+                    if submitted:
+                        submit_human_vote(item['id'], v_val, v_dens)
+                        st.session_state['voted_ids'].add(item['id'])
+                        st.rerun()
                 
-                st.markdown("**2. Physical Space**")
-                v_dens = st.slider("Empty Void (0) ↔ Crowded (100)", 0, 100, 50, key=f"d_{item['id']}", disabled=has_voted)
-                
-                if st.button("Submit Vote" if not has_voted else "✅ Voted", key=f"b_{item['id']}", disabled=has_voted):
-                    submit_human_vote(item['id'], v_val, v_dens)
-                    st.session_state['voted_ids'].add(item['id'])
-                    st.rerun()
-                
+                if item['vote_count'] > 0:
+                     st.caption(f"Votes: {item['vote_count']}")
+
                 if item['ai_reasoning']:
                     st.info(f"🤖 AI: Pain={item['ai_valence']} | Crowd={item['ai_density']}")
                 st.divider()
@@ -278,36 +283,22 @@ elif app_mode == "Run Analysis" and is_host:
         st.success("Done!")
         st.rerun()
 
-# === PHASE 4: THE MAP (CLUSTERING) ===
+# === PHASE 4: THE MAP ===
 elif app_mode == "The Map (Cluster View)" and is_host:
     st.markdown("### 🗺️ The Map of Loneliness")
     subs = get_all_submissions()
-    
-    if not subs:
-        st.warning("No Data.")
+    if not subs: st.warning("No Data.")
     else:
-        # 1. SCATTER PLOT
         df = pd.DataFrame(subs)
-        # Prefer AI score, fallback to Human Avg
         df['X (Crowd)'] = df.apply(lambda r: r['ai_density'] if r['ai_density'] > 0 else r['avg_density'], axis=1)
         df['Y (Pain)'] = df.apply(lambda r: r['ai_valence'] if r['ai_valence'] > 0 else r['avg_valence'], axis=1)
         
-        st.scatter_chart(
-            df,
-            x='X (Crowd)',
-            y='Y (Pain)',
-            color='team_name',
-            size=100,
-            use_container_width=True
-        )
+        st.scatter_chart(df, x='X (Crowd)', y='Y (Pain)', color='team_name', size=100, use_container_width=True)
         st.caption("⬅️ EMPTY (Void) .................................... CROWDED (Urban) ➡️")
         
         st.divider()
         st.subheader("📂 The 4 Types of Solitude")
-        
-        # Group items
         clusters = {"Urban Isolation": [], "The Abyssal Void": [], "Anonymous Observer": [], "Sacred Solitude": []}
-        
         for s in subs:
             val = s['ai_valence'] if s['ai_valence'] > 0 else s['avg_valence']
             dens = s['ai_density'] if s['ai_density'] > 0 else s['avg_density']
@@ -319,28 +310,23 @@ elif app_mode == "The Map (Cluster View)" and is_host:
             st.markdown("### 🏙️ Urban Isolation\n*(Painful + Crowded)*")
             for s in clusters["Urban Isolation"]:
                 with st.expander(f"{s['team_name']}"):
-                    st.image(s['image'])
-                    st.write(s['prompt'])
-            
+                    st.image(s['image']); st.write(s['prompt'])
             st.markdown("### ☕ Anonymous Observer\n*(Peaceful + Crowded)*")
             for s in clusters["Anonymous Observer"]:
                 with st.expander(f"{s['team_name']}"):
-                    st.image(s['image'])
-                    st.write(s['prompt'])
-
+                    st.image(s['image']); st.write(s['prompt'])
         with c2:
             st.markdown("### 🌌 The Abyssal Void\n*(Painful + Empty)*")
             for s in clusters["The Abyssal Void"]:
                 with st.expander(f"{s['team_name']}"):
-                    st.image(s['image'])
-                    st.write(s['prompt'])
-
+                    st.image(s['image']); st.write(s['prompt'])
             st.markdown("### 🌲 Sacred Solitude\n*(Peaceful + Empty)*")
             for s in clusters["Sacred Solitude"]:
                 with st.expander(f"{s['team_name']}"):
-                    st.image(s['image'])
-                    st.write(s['prompt'])
+                    st.image(s['image']); st.write(s['prompt'])
 
+elif app_mode == "Download Data" and is_host:
+    st.download_button("Download CSV", convert_db_to_csv(), "loneliness_map.csv", "text/csv")
 # === DOWNLOAD ===
 elif app_mode == "Download Data" and is_host:
     st.download_button("Download CSV", convert_db_to_csv(), "loneliness_map.csv", "text/csv")
