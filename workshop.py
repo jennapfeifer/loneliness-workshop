@@ -8,27 +8,29 @@ import time
 import sqlite3
 import base64
 import csv
+import pandas as pd
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Engineering loneliness", layout="wide")
+st.set_page_config(page_title="Loneliness Workshop: The Map", layout="wide")
 HOST_PASSWORD = "admin123" 
 
-# --- DATABASE FUNCTIONS ---
-
+# --- DATABASE FUNCTIONS (V5 Schema for Density/Valence) ---
 def init_db():
-    """Ensures the table exists."""
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
-        # Using v3 to match previous schema
-        c.execute('''CREATE TABLE IF NOT EXISTS gallery_v3
+        # V5 Schema: Stores Valence (Peace/Pain) and Density (Void/Crowd)
+        c.execute('''CREATE TABLE IF NOT EXISTS gallery_v5
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       team_name TEXT,
                       prompt TEXT,
                       image_blob BLOB,
-                      vote_sum INTEGER DEFAULT 0,
                       vote_count INTEGER DEFAULT 0,
-                      average_score REAL DEFAULT 0,
-                      ai_score INTEGER,
+                      sum_valence INTEGER DEFAULT 0,  -- Peace vs Pain
+                      sum_density INTEGER DEFAULT 0,  -- Void vs Crowd
+                      avg_valence REAL DEFAULT 0,
+                      avg_density REAL DEFAULT 0,
+                      ai_valence INTEGER DEFAULT 0,
+                      ai_density INTEGER DEFAULT 0,
                       ai_reasoning TEXT,
                       ai_details TEXT)''')
         conn.commit()
@@ -47,46 +49,52 @@ def save_submission(team, prompt, img_obj):
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
         img_blob = image_to_blob(img_obj)
-        c.execute("INSERT INTO gallery_v3 (team_name, prompt, image_blob, vote_sum, vote_count, average_score) VALUES (?, ?, ?, 0, 0, 0)",
+        c.execute("""INSERT INTO gallery_v5 
+                     (team_name, prompt, image_blob, vote_count, sum_valence, sum_density) 
+                     VALUES (?, ?, ?, 0, 0, 0)""",
                   (team, prompt, img_blob))
         conn.commit()
 
 def get_all_submissions():
     with sqlite3.connect('workshop.db') as conn:
+        conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM gallery_v3")
+        c.execute("SELECT * FROM gallery_v5")
         data = c.fetchall()
         
     submissions = []
     for row in data:
-        submissions.append({
-            'id': row[0], 'team': row[1], 'prompt': row[2],
-            'image': blob_to_image(row[3]), 
-            'vote_sum': row[4], 'vote_count': row[5], 'human_score': row[6],
-            'ai_score': row[7], 'ai_reasoning': row[8], 'ai_details': row[9]
-        })
+        sub = dict(row)
+        sub['image'] = blob_to_image(row['image_blob'])
+        submissions.append(sub)
     return submissions
 
-def submit_human_vote(img_id, score):
-    """Calculates the AVERAGE of all votes for an image."""
+def submit_human_vote(img_id, val, dens):
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
-        c.execute("SELECT vote_sum, vote_count FROM gallery_v3 WHERE id = ?", (img_id,))
+        c.execute("SELECT sum_valence, sum_density, vote_count FROM gallery_v5 WHERE id = ?", (img_id,))
         res = c.fetchone()
         if res:
-            current_sum, current_count = res
-            new_sum = current_sum + score
-            new_count = current_count + 1
-            new_avg = new_sum / new_count
-            c.execute("UPDATE gallery_v3 SET vote_sum = ?, vote_count = ?, average_score = ? WHERE id = ?", 
-                      (new_sum, new_count, new_avg, img_id))
+            s_val, s_dens, count = res
+            n_val, n_dens = s_val + val, s_dens + dens
+            n_count = count + 1
+            c.execute("""UPDATE gallery_v5 SET 
+                         sum_valence=?, sum_density=?, vote_count=?,
+                         avg_valence=?, avg_density=?
+                         WHERE id=?""", 
+                      (n_val, n_dens, n_count, 
+                       n_val/n_count, n_dens/n_count, img_id))
             conn.commit()
 
 def update_ai_results(img_id, analysis_json):
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
-        c.execute("UPDATE gallery_v3 SET ai_score = ?, ai_reasoning = ?, ai_details = ? WHERE id = ?",
-                  (analysis_json.get('final_loneliness_index',0), 
+        c.execute("""UPDATE gallery_v5 SET 
+                     ai_valence=?, ai_density=?, 
+                     ai_reasoning=?, ai_details=? 
+                     WHERE id=?""",
+                  (analysis_json.get('valence_score',0), 
+                   analysis_json.get('density_score',0),
                    analysis_json.get('reasoning','Failed'), 
                    json.dumps(analysis_json), 
                    img_id))
@@ -95,40 +103,29 @@ def update_ai_results(img_id, analysis_json):
 def reset_db():
     with sqlite3.connect('workshop.db') as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM gallery_v3")
+        c.execute("DELETE FROM gallery_v5")
         conn.commit()
 
-# --- HOST DATA EXPORT (FIXED) ---
-def convert_db_to_csv():
-    """Helper to download all collected data using StringIO."""
-    submissions = get_all_submissions()
+# --- CLUSTERING LOGIC (The 4 Types) ---
+def get_quadrant(valence, density):
+    # Valence: 0 (Peace) -> 100 (Pain)
+    # Density: 0 (Void) -> 100 (Crowd)
     
-    # Use StringIO to create a string buffer for CSV data
-    output = StringIO()
-    writer = csv.writer(output)
-    
-    # Write Header
-    writer.writerow(["Team Name", "Prompt", "Human Average Score", "Vote Count", "AI Score", "AI Reasoning"])
-    
-    # Write Rows
-    for s in submissions:
-        writer.writerow([
-            s['team'], 
-            s['prompt'], 
-            s['human_score'], 
-            s['vote_count'], 
-            s['ai_score'], 
-            s['ai_reasoning']
-        ])
-        
-    return output.getvalue()
+    if valence >= 50 and density >= 50:
+        return "Urban Isolation", "🏙️ (Painful Crowd)"
+    elif valence >= 50 and density < 50:
+        return "The Abyssal Void", "🌌 (Painful Empty)"
+    elif valence < 50 and density >= 50:
+        return "Anonymous Observer", "☕ (Peaceful Crowd)"
+    else:
+        return "Sacred Solitude", "🌲 (Peaceful Empty)"
 
-# --- ROBUST AI CLIENT ---
+# --- AI CLIENT ---
 def retry_api_call(func, retries=3, delay=2):
     for attempt in range(retries):
         try:
             return func()
-        except Exception as e:
+        except Exception:
             if attempt < retries - 1:
                 time.sleep(delay)
                 continue
@@ -144,29 +141,25 @@ def generate_image(client, prompt):
                 image_config=types.ImageConfig(aspect_ratio="1:1"),
             ),
         )
-        generated_image_part = next((p for p in response.parts if p.inline_data), None)
-        if generated_image_part:
-            img_data = generated_image_part.inline_data.data
-            return Image.open(BytesIO(img_data))
+        img_part = next((p for p in response.parts if p.inline_data), None)
+        if img_part: return Image.open(BytesIO(img_part.inline_data.data))
         return None
     return retry_api_call(_call)
 
-def analyze_loneliness_literature(client, image):
+def analyze_dimensions(client, image):
     lit_prompt = """
-    You are an expert psychologist. Analyze this image based on the **Multidimensional Theory of Loneliness** (Weiss, 1973).
-    Evaluate on these dimensions:
-    1. **Social Isolation:** Absence of community/network.
-    2. **Emotional Isolation:** Absence of close attachment.
-    3. **Existential Void:** Sense of meaninglessness.
-
+    Analyze this image on these 2 specific scales (0-100).
+    
+    1. Valence (Peace vs Pain): 
+       - 0 = Peaceful, Restorative, Calm, 'Happy Alone'
+       - 100 = Painful, Scary, Depressing, 'Sad Alone'
+       
+    2. Density (Void vs Crowd):
+       - 0 = The Void (Empty space, desert, ocean, single room, vastness)
+       - 100 = The Crowd (City street, party, clutter, chaos, many people)
+    
     Return STRICTLY JSON:
-    {
-        "social_score": (int 0-100),
-        "emotional_score": (int 0-100),
-        "existential_score": (int 0-100),
-        "final_loneliness_index": (int 0-100, weighted average),
-        "reasoning": "Concise explanation."
-    }
+    {"valence_score": int, "density_score": int, "reasoning": "string"}
     """
     def _call():
         response = client.models.generate_content(
@@ -178,167 +171,176 @@ def analyze_loneliness_literature(client, image):
 
     result = retry_api_call(_call)
     if result: return result
-    return {"final_loneliness_index": 0, "reasoning": "Analysis failed."}
+    return {"valence_score": 0, "density_score": 0, "reasoning": "Failed."}
 
-# --- SIDEBAR ---
+# --- HOST DATA EXPORT ---
+def convert_db_to_csv():
+    submissions = get_all_submissions()
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Team", "Prompt", "Vote Count", "Human: Pain", "Human: Crowd", "AI: Pain", "AI: Crowd", "Reasoning"])
+    for s in submissions:
+        writer.writerow([
+            s['team_name'], s['prompt'], s['vote_count'],
+            f"{s['avg_valence']:.1f}", f"{s['avg_density']:.1f}",
+            s['ai_valence'], s['ai_density'], s['ai_reasoning']
+        ])
+    return output.getvalue()
+
+# --- UI SETUP ---
 with st.sidebar:
     st.header("⚙️ Setup")
-    api_key = None
-    try:
-        api_key = st.secrets["google_api"]["key"]
-    except Exception:
-        st.warning("Secrets not found.")
-        api_key = st.text_input("Enter Google API Key", type="password")
+    api_key = st.secrets["google_api"]["key"] if "google_api" in st.secrets else st.text_input("API Key", type="password")
+    client = genai.Client(api_key=api_key) if api_key else None
     
-    client = None
-    if api_key:
-        try:
-            client = genai.Client(api_key=api_key)
-            st.success("System Online")
-        except Exception:
-            pass
-
     st.divider()
     team_name = st.text_input("Team Name", placeholder="Anonymous")
-    if not team_name: team_name = "Anonymous"
-
+    
     st.divider()
     user_role = st.radio("Role:", ["Participant", "Host (Admin)"])
     is_host = False
     if user_role == "Host (Admin)":
-        pwd = st.text_input("Password", type="password")
-        if pwd == HOST_PASSWORD:
+        if st.text_input("Password", type="password") == HOST_PASSWORD:
             is_host = True
-            st.success("Admin Active")
             if st.button("⚠️ RESET DATA"):
                 reset_db()
                 st.rerun()
 
     if is_host:
-         app_mode = st.radio("Controls:", ["View Gallery", "Run Analysis", "Download Data"])
-         app_mode_prefix = "HOST: "
+         app_mode = st.radio("Controls:", ["View Gallery", "Run Analysis", "The Map (Cluster View)", "Download Data"])
     else:
          app_mode = st.radio("Steps:", ["1. Create", "2. Gallery & Vote"])
-         app_mode_prefix = "PARTICIPANT: "
 
-# --- MAIN APP ---
-st.title(f"🧩 Loneliness Experiment | {app_mode_prefix}{app_mode}")
-
-# Initialize session state for tracking user votes
-if 'voted_ids' not in st.session_state:
-    st.session_state['voted_ids'] = set()
+st.title(f"🧩 The Texture of Loneliness")
+if 'voted_ids' not in st.session_state: st.session_state['voted_ids'] = set()
 
 # === PHASE 1: CREATE ===
 if app_mode == "1. Create" and not is_host:
     if 'current_draft' not in st.session_state: st.session_state['current_draft'] = None
-
-    st.markdown("Draft your image. **Your prompt will be saved and analyzed.**")
+    st.markdown("Create an image. Is it a **Crowded** loneliness or an **Empty** one?")
     
-    col1, col2 = st.columns([1.2, 1])
+    col1, col2 = st.columns([1, 1])
     with col1:
-        draft_prompt = st.text_area("Describe the image:", height=150, 
-            placeholder="A single chair in a vast, empty concrete room...")
-        
+        draft_prompt = st.text_area("Prompt:", height=150)
         if st.button("Generate Draft", type="primary", disabled=not client):
-            with st.spinner("Generating..."):
+            with st.spinner("Dreaming..."):
                 img = generate_image(client, draft_prompt)
-                if img:
-                    st.session_state['current_draft'] = {'image': img, 'prompt': draft_prompt}
-
+                if img: st.session_state['current_draft'] = {'image': img, 'prompt': draft_prompt}
     with col2:
         if st.session_state['current_draft']:
-            st.image(st.session_state['current_draft']['image'], caption="Preview", use_container_width=True)
+            st.image(st.session_state['current_draft']['image'], caption="Draft", use_container_width=True)
             c1, c2 = st.columns(2)
-            with c1:
-                if st.button("♻️ Edit Prompt"):
-                    st.session_state['current_draft'] = None
-                    st.rerun()
-            with c2:
-                if st.button("✅ Submit", type="primary"):
-                    save_submission(team_name, st.session_state['current_draft']['prompt'], st.session_state['current_draft']['image'])
-                    st.session_state['current_draft'] = None
-                    st.success("Submitted!")
-                    time.sleep(1)
-                    st.rerun()
+            if c1.button("♻️ Edit"): st.session_state['current_draft'] = None; st.rerun()
+            if c2.button("✅ Submit"):
+                save_submission(team_name, st.session_state['current_draft']['prompt'], st.session_state['current_draft']['image'])
+                st.session_state['current_draft'] = None; st.success("Submitted!"); time.sleep(1); st.rerun()
 
-# === PHASE 2: GALLERY ===
+# === PHASE 2: VOTING ===
 elif app_mode == "2. Gallery & Vote" or app_mode == "View Gallery":
-    st.markdown("Review submissions. **Vote on how lonely the image AND prompt feel.**")
-    
-    submissions = get_all_submissions()
-    if not submissions:
-        st.warning("Gallery empty.")
+    st.markdown("Where does this image fit on the map?")
+    subs = get_all_submissions()
+    if not subs: st.warning("Empty Gallery")
     else:
-        submissions.sort(key=lambda x: x['id'], reverse=True)
+        subs.sort(key=lambda x: x['id'], reverse=True)
         cols = st.columns(3)
-        for idx, item in enumerate(submissions):
+        for idx, item in enumerate(subs):
             with cols[idx % 3]:
                 st.image(item['image'], use_container_width=True)
+                st.caption(f"_{item['prompt']}_")
                 
-                # --- VISIBLE PROMPT ---
-                st.markdown(f"**Prompt:** _{item['prompt']}_")
-
-                # Voting
-                st.caption(f"Avg Score: **{int(item['human_score'])}** ({item['vote_count']} votes)")
-                
-                # Check if user already voted
                 has_voted = item['id'] in st.session_state['voted_ids']
                 
-                vote_val = st.slider("Rate Loneliness", 0, 100, 50, key=f"s_{item['id']}", disabled=has_voted)
+                # --- NEW SLIDERS ---
+                st.markdown("**1. Emotional Vibe**")
+                v_val = st.slider("Peaceful (0) ↔ Painful (100)", 0, 100, 50, key=f"v_{item['id']}", disabled=has_voted)
                 
-                # Button Logic
-                btn_label = "✅ Vote Submitted" if has_voted else f"Submit Vote (#{item['id']})"
+                st.markdown("**2. Physical Space**")
+                v_dens = st.slider("Empty Void (0) ↔ Crowded (100)", 0, 100, 50, key=f"d_{item['id']}", disabled=has_voted)
                 
-                if st.button(btn_label, key=f"b_{item['id']}", disabled=has_voted):
-                    submit_human_vote(item['id'], vote_val)
+                if st.button("Submit Vote" if not has_voted else "✅ Voted", key=f"b_{item['id']}", disabled=has_voted):
+                    submit_human_vote(item['id'], v_val, v_dens)
                     st.session_state['voted_ids'].add(item['id'])
-                    st.success("Vote Added!")
-                    time.sleep(0.5)
                     st.rerun()
-
-                if item['ai_score']:
-                     st.info(f"🤖 AI Score: **{item['ai_score']}**")
+                
+                if item['ai_reasoning']:
+                    st.info(f"🤖 AI: Pain={item['ai_valence']} | Crowd={item['ai_density']}")
                 st.divider()
 
 # === PHASE 3: ANALYSIS ===
 elif app_mode == "Run Analysis" and is_host:
-    st.markdown("### Host: AI Judgment")
-    submissions = get_all_submissions()
-    
-    if st.button("🚀 Analyze All Images", type="primary"):
-        progress_bar = st.progress(0)
-        for i, item in enumerate(submissions):
-            result = analyze_loneliness_literature(client, item['image'])
-            update_ai_results(item['id'], result)
-            progress_bar.progress((i + 1) / len(submissions))
+    if st.button("🚀 Analyze Dimensions"):
+        subs = get_all_submissions()
+        bar = st.progress(0)
+        for i, item in enumerate(subs):
+            res = analyze_dimensions(client, item['image'])
+            update_ai_results(item['id'], res)
+            bar.progress((i+1)/len(subs))
         st.success("Done!")
         st.rerun()
 
-    st.divider()
-    # Leaderboard
-    submissions.sort(key=lambda x: x['ai_score'] if x['ai_score'] else 0, reverse=True)
-    for rank, item in enumerate(submissions):
-        if item['ai_score']:
-            with st.container():
-                c1, c2 = st.columns([1, 3])
-                with c1: st.image(item['image'], use_container_width=True)
-                with c2:
-                    st.subheader(f"#{rank+1} Team {item['team']}")
-                    st.write(f"**Prompt:** {item['prompt']}")
-                    st.write(f"**AI Score:** {item['ai_score']} | **Human Avg:** {int(item['human_score'])}")
-                    st.markdown(f"> {item['ai_reasoning']}")
-                st.divider()
+# === PHASE 4: THE MAP (CLUSTERING) ===
+elif app_mode == "The Map (Cluster View)" and is_host:
+    st.markdown("### 🗺️ The Map of Loneliness")
+    subs = get_all_submissions()
+    
+    if not subs:
+        st.warning("No Data.")
+    else:
+        # 1. SCATTER PLOT
+        df = pd.DataFrame(subs)
+        # Prefer AI score, fallback to Human Avg
+        df['X (Crowd)'] = df.apply(lambda r: r['ai_density'] if r['ai_density'] > 0 else r['avg_density'], axis=1)
+        df['Y (Pain)'] = df.apply(lambda r: r['ai_valence'] if r['ai_valence'] > 0 else r['avg_valence'], axis=1)
+        
+        st.scatter_chart(
+            df,
+            x='X (Crowd)',
+            y='Y (Pain)',
+            color='team_name',
+            size=100,
+            use_container_width=True
+        )
+        st.caption("⬅️ EMPTY (Void) .................................... CROWDED (Urban) ➡️")
+        
+        st.divider()
+        st.subheader("📂 The 4 Types of Solitude")
+        
+        # Group items
+        clusters = {"Urban Isolation": [], "The Abyssal Void": [], "Anonymous Observer": [], "Sacred Solitude": []}
+        
+        for s in subs:
+            val = s['ai_valence'] if s['ai_valence'] > 0 else s['avg_valence']
+            dens = s['ai_density'] if s['ai_density'] > 0 else s['avg_density']
+            name, emoji = get_quadrant(val, dens)
+            clusters[name].append(s)
 
-# === PHASE 4: DOWNLOAD DATA ===
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### 🏙️ Urban Isolation\n*(Painful + Crowded)*")
+            for s in clusters["Urban Isolation"]:
+                with st.expander(f"{s['team_name']}"):
+                    st.image(s['image'])
+                    st.write(s['prompt'])
+            
+            st.markdown("### ☕ Anonymous Observer\n*(Peaceful + Crowded)*")
+            for s in clusters["Anonymous Observer"]:
+                with st.expander(f"{s['team_name']}"):
+                    st.image(s['image'])
+                    st.write(s['prompt'])
+
+        with c2:
+            st.markdown("### 🌌 The Abyssal Void\n*(Painful + Empty)*")
+            for s in clusters["The Abyssal Void"]:
+                with st.expander(f"{s['team_name']}"):
+                    st.image(s['image'])
+                    st.write(s['prompt'])
+
+            st.markdown("### 🌲 Sacred Solitude\n*(Peaceful + Empty)*")
+            for s in clusters["Sacred Solitude"]:
+                with st.expander(f"{s['team_name']}"):
+                    st.image(s['image'])
+                    st.write(s['prompt'])
+
+# === DOWNLOAD ===
 elif app_mode == "Download Data" and is_host:
-    st.markdown("### 📥 Collect Data")
-    st.write("Download the full workshop results (Prompts, Votes, AI Scores) as a CSV file.")
-    
-    csv_file = convert_db_to_csv()
-    
-    st.download_button(
-        label="Download Results (CSV)",
-        data=csv_file,
-        file_name="workshop_results.csv",
-        mime="text/csv"
-    )
+    st.download_button("Download CSV", convert_db_to_csv(), "loneliness_map.csv", "text/csv")
