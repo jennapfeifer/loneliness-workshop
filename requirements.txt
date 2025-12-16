@@ -2,3 +2,4 @@ streamlit
 google-genai
 Pillow
 pandas
+scikit-learn
