@@ -1,15 +1,15 @@
 import streamlit as st
+import altair as alt
+
 from google import genai
 from google.genai import types
 
 from io import BytesIO, StringIO
 from PIL import Image
 
-import time
 import sqlite3
 import csv
 import pandas as pd
-import numpy as np
 from sklearn.cluster import KMeans
 
 # ============================================================
@@ -70,18 +70,18 @@ init_db()
 # ============================================================
 # IMAGE HELPERS
 # ============================================================
-def image_to_blob(image):
+def image_to_blob(image: Image.Image) -> bytes:
     buf = BytesIO()
     image.save(buf, format="PNG")
     return buf.getvalue()
 
-def blob_to_image(blob):
+def blob_to_image(blob: bytes) -> Image.Image:
     return Image.open(BytesIO(blob))
 
 # ============================================================
 # DB OPERATIONS
 # ============================================================
-def save_submission(team, prompt, img):
+def save_submission(team: str, prompt: str, img: Image.Image):
     with get_conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -103,7 +103,7 @@ def get_submissions():
         out.append(d)
     return out
 
-def submit_vote(image_id, pid, iso, inte, pain, rel):
+def submit_vote(image_id: int, pid: str, iso: int, inte: int, pain: int, rel: int):
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("""
@@ -118,7 +118,7 @@ def submit_vote(image_id, pid, iso, inte, pain, rel):
         """, (image_id, pid, iso, inte, pain, rel))
         conn.commit()
 
-def vote_stats(image_id):
+def vote_stats(image_id: int):
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("""
@@ -131,11 +131,11 @@ def vote_stats(image_id):
         """, (image_id,))
         r = c.fetchone()
 
-    if r["n"] == 0:
-        return dict(n=0, avg_iso=0, avg_int=0, avg_pain=0, avg_rel=0)
+    if not r or r["n"] == 0:
+        return dict(n=0, avg_iso=0.0, avg_int=0.0, avg_pain=0.0, avg_rel=0.0)
     return dict(r)
 
-def has_voted(image_id, pid):
+def has_voted(image_id: int, pid: str) -> bool:
     with get_conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -147,7 +147,7 @@ def has_voted(image_id, pid):
 # ============================================================
 # CLUSTERING
 # ============================================================
-def add_quadrants(df):
+def add_quadrants(df: pd.DataFrame):
     iso_med = df["X"].median()
     int_med = df["Y"].median()
 
@@ -161,7 +161,35 @@ def add_quadrants(df):
         return "Low isolation × Low intensity"
 
     df["Cluster"] = df.apply(q, axis=1)
-    return df, iso_med, int_med
+    return df, float(iso_med), float(int_med)
+
+# ============================================================
+# PLOTTING (Altair with bounded axes 1–5)
+# ============================================================
+def bounded_scatter(df: pd.DataFrame, color_col: str, title: str):
+    # Keep only points with X/Y in range (should already be 1–5, but just in case)
+    df = df.copy()
+    df["X"] = df["X"].clip(1, 5)
+    df["Y"] = df["Y"].clip(1, 5)
+
+    tooltip_cols = []
+    for col in ["team_name", "prompt", "n", "avg_iso", "avg_int", "avg_pain", "avg_rel", "X", "Y"]:
+        if col in df.columns:
+            tooltip_cols.append(col)
+
+    chart = (
+        alt.Chart(df)
+        .mark_circle(size=160)
+        .encode(
+            x=alt.X("X:Q", scale=alt.Scale(domain=[1, 5]), title="Isolation (1–5)"),
+            y=alt.Y("Y:Q", scale=alt.Scale(domain=[1, 5]), title="Intensity (1–5)"),
+            color=alt.Color(f"{color_col}:N", legend=alt.Legend(title=title)),
+            tooltip=tooltip_cols
+        )
+        .properties(height=520)
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 # ============================================================
 # SIDEBAR
@@ -186,14 +214,17 @@ with st.sidebar:
 # HEADER
 # ============================================================
 st.title("Engineering loneliness with GenAI")
-st.caption(
-    "Describe a moment of loneliness and encourage photorealistic, documentary-style prompting."
-)
+st.caption("Describe a moment of loneliness and encourage photorealistic, documentary-style prompting.")
 
 # ============================================================
 # CREATE
 # ============================================================
 if mode == "Create" and not is_host:
+    # If secrets missing, show a friendly error instead of crashing
+    if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
+        st.error("Missing Google API key. Set st.secrets['google_api']['key'] in your Streamlit secrets.")
+        st.stop()
+
     client = genai.Client(api_key=st.secrets["google_api"]["key"])
 
     prompt = st.text_area(
@@ -215,10 +246,14 @@ if mode == "Create" and not is_host:
                         image_config=types.ImageConfig(aspect_ratio="3:2")
                     )
                 )
-                img_part = next(p for p in response.parts if p.inline_data)
-                img = Image.open(BytesIO(img_part.inline_data.data))
-                st.session_state["draft"] = img
-                st.image(img)
+
+                img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
+                if img_part is None:
+                    st.error("No image returned. Try again with a simpler prompt.")
+                else:
+                    img = Image.open(BytesIO(img_part.inline_data.data))
+                    st.session_state["draft"] = img
+                    st.image(img, use_container_width=True)
 
     if "draft" in st.session_state:
         if st.button("Submit image"):
@@ -236,28 +271,54 @@ elif mode == "Rate" and not is_host:
         st.stop()
 
     subs = get_submissions()
+    if not subs:
+        st.info("No images yet.")
+        st.stop()
+
     cols = st.columns(3)
 
     for i, s in enumerate(subs):
-        stats = vote_stats(s["id"])
         voted = has_voted(s["id"], participant_id)
 
         with cols[i % 3]:
             st.image(s["image"], use_container_width=True)
             st.caption(s["prompt"])
 
+            # Show vote count (helps participants feel progress)
+            stats = vote_stats(s["id"])
+            if stats["n"] > 0:
+                st.caption(f"Ratings so far: {int(stats['n'])}")
+
             with st.form(f"vote_{s['id']}"):
-                iso = st.slider("Isolation", 1, 5, 3)
-                inte = st.slider("Intensity", 1, 5, 3)
-                pain = st.slider("Pain", 1, 5, 3)
-                rel = st.slider("Relatability", 1, 5, 3)
-                submitted = st.form_submit_button(
-                    "Submit",
-                    disabled=voted
-                )
+                iso = st.slider("Isolation", 1, 5, 3, key=f"iso_{s['id']}")
+                inte = st.slider("Intensity", 1, 5, 3, key=f"inte_{s['id']}")
+                pain = st.slider("Pain", 1, 5, 3, key=f"pain_{s['id']}")
+                rel = st.slider("Relatability", 1, 5, 3, key=f"rel_{s['id']}")
+
+                submitted = st.form_submit_button("Submit", disabled=voted)
                 if submitted:
                     submit_vote(s["id"], participant_id, iso, inte, pain, rel)
                     st.rerun()
+
+            if voted:
+                st.caption("✅ You already rated this image.")
+
+# ============================================================
+# GALLERY (HOST)
+# ============================================================
+elif mode == "Gallery" and is_host:
+    subs = get_submissions()
+    if not subs:
+        st.info("No images yet.")
+        st.stop()
+
+    cols = st.columns(3)
+    for i, s in enumerate(subs):
+        stats = vote_stats(s["id"])
+        with cols[i % 3]:
+            st.image(s["image"], use_container_width=True)
+            st.caption(s["prompt"])
+            st.caption(f"Ratings: {int(stats['n'])}")
 
 # ============================================================
 # MAP: QUADRANTS
@@ -270,10 +331,12 @@ elif mode == "Map (Quadrants)" and is_host:
         stats = vote_stats(s["id"])
         if stats["n"] >= MIN_RATINGS_FOR_MAP:
             rows.append({
-                **s,
+                "id": s["id"],
+                "team_name": s["team_name"],
+                "prompt": s["prompt"],
                 **stats,
-                "X": stats["avg_iso"],
-                "Y": stats["avg_int"]
+                "X": float(stats["avg_iso"]),
+                "Y": float(stats["avg_int"])
             })
 
     if len(rows) < 2:
@@ -283,20 +346,8 @@ elif mode == "Map (Quadrants)" and is_host:
     df = pd.DataFrame(rows)
     df, iso_split, int_split = add_quadrants(df)
 
-    st.scatter_chart(
-        df,
-        x="X",
-        y="Y",
-        color="Cluster",
-        size=100,
-        x_range=(1, 5),
-        y_range=(1, 5),
-        use_container_width=True
-    )
-
-    st.caption(
-        f"Isolation split = {iso_split:.2f} | Intensity split = {int_split:.2f}"
-    )
+    bounded_scatter(df, color_col="Cluster", title="Quadrant cluster")
+    st.caption(f"Isolation split = {iso_split:.2f} | Intensity split = {int_split:.2f}")
 
 # ============================================================
 # MAP: KMEANS
@@ -309,29 +360,23 @@ elif mode == "Map (KMeans)" and is_host:
         stats = vote_stats(s["id"])
         if stats["n"] >= MIN_RATINGS_FOR_MAP:
             rows.append({
-                **s,
-                "X": stats["avg_iso"],
-                "Y": stats["avg_int"]
+                "id": s["id"],
+                "team_name": s["team_name"],
+                "prompt": s["prompt"],
+                **stats,
+                "X": float(stats["avg_iso"]),
+                "Y": float(stats["avg_int"])
             })
 
     if len(rows) < KMEANS_MIN_IMAGES:
-        st.warning("At least 12 images are required for K-means.")
+        st.warning("At least 12 rated images are required for K-means.")
         st.stop()
 
     df = pd.DataFrame(rows)
     km = KMeans(n_clusters=KMEANS_K, random_state=42, n_init=10)
-    df["Cluster"] = km.fit_predict(df[["X", "Y"]])
+    df["Cluster"] = km.fit_predict(df[["X", "Y"]]).astype(str)
 
-    st.scatter_chart(
-        df,
-        x="X",
-        y="Y",
-        color="Cluster",
-        size=100,
-        x_range=(1, 5),
-        y_range=(1, 5),
-        use_container_width=True
-    )
+    bounded_scatter(df, color_col="Cluster", title="KMeans cluster")
 
 # ============================================================
 # DOWNLOAD
@@ -342,11 +387,16 @@ elif mode == "Download" and is_host:
 
     for s in subs:
         stats = vote_stats(s["id"])
-        rows.append({**s, **stats})
+        rows.append({
+            "id": s["id"],
+            "team_name": s["team_name"],
+            "prompt": s["prompt"],
+            **stats
+        })
 
     df = pd.DataFrame(rows)
     buf = StringIO()
-    df.drop(columns=["image_blob", "image"]).to_csv(buf, index=False)
+    df.to_csv(buf, index=False)
 
     st.download_button(
         "Download CSV",
@@ -354,3 +404,7 @@ elif mode == "Download" and is_host:
         "loneliness_workshop.csv",
         "text/csv"
     )
+
+else:
+    st.info("Select a mode from the sidebar.")
+
