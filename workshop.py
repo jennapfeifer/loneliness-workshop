@@ -8,7 +8,6 @@ from io import BytesIO, StringIO
 from PIL import Image
 
 import sqlite3
-import csv
 import pandas as pd
 from sklearn.cluster import KMeans
 
@@ -50,15 +49,14 @@ def init_db():
         )
         """)
 
+        # NOTE: New schema: valence + intensity only
         c.execute("""
         CREATE TABLE IF NOT EXISTS votes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             image_id INTEGER NOT NULL,
             participant_id TEXT NOT NULL,
-            iso INTEGER NOT NULL,
-            inte INTEGER NOT NULL,
-            pain INTEGER NOT NULL,
-            rel INTEGER NOT NULL,
+            valence INTEGER NOT NULL,
+            intensity INTEGER NOT NULL,
             created_at TEXT DEFAULT (datetime('now')),
             UNIQUE(image_id, participant_id)
         )
@@ -103,19 +101,17 @@ def get_submissions():
         out.append(d)
     return out
 
-def submit_vote(image_id: int, pid: str, iso: int, inte: int, pain: int, rel: int):
+def submit_vote(image_id: int, pid: str, valence: int, intensity: int):
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("""
-        INSERT INTO votes (image_id, participant_id, iso, inte, pain, rel)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO votes (image_id, participant_id, valence, intensity)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(image_id, participant_id) DO UPDATE SET
-            iso=excluded.iso,
-            inte=excluded.inte,
-            pain=excluded.pain,
-            rel=excluded.rel,
+            valence=excluded.valence,
+            intensity=excluded.intensity,
             created_at=datetime('now')
-        """, (image_id, pid, iso, inte, pain, rel))
+        """, (image_id, pid, valence, intensity))
         conn.commit()
 
 def vote_stats(image_id: int):
@@ -123,16 +119,14 @@ def vote_stats(image_id: int):
         c = conn.cursor()
         c.execute("""
         SELECT COUNT(*) n,
-               AVG(iso) avg_iso,
-               AVG(inte) avg_int,
-               AVG(pain) avg_pain,
-               AVG(rel) avg_rel
+               AVG(valence) avg_valence,
+               AVG(intensity) avg_intensity
         FROM votes WHERE image_id=?
         """, (image_id,))
         r = c.fetchone()
 
     if not r or r["n"] == 0:
-        return dict(n=0, avg_iso=0.0, avg_int=0.0, avg_pain=0.0, avg_rel=0.0)
+        return dict(n=0, avg_valence=0.0, avg_intensity=0.0)
     return dict(r)
 
 def has_voted(image_id: int, pid: str) -> bool:
@@ -148,32 +142,31 @@ def has_voted(image_id: int, pid: str) -> bool:
 # CLUSTERING
 # ============================================================
 def add_quadrants(df: pd.DataFrame):
-    iso_med = df["X"].median()
+    val_med = df["X"].median()
     int_med = df["Y"].median()
 
     def q(r):
-        if r["X"] >= iso_med and r["Y"] >= int_med:
-            return "High isolation × High intensity"
-        if r["X"] >= iso_med and r["Y"] < int_med:
-            return "High isolation × Low intensity"
-        if r["X"] < iso_med and r["Y"] >= int_med:
-            return "Low isolation × High intensity"
-        return "Low isolation × Low intensity"
+        if r["X"] >= val_med and r["Y"] >= int_med:
+            return "High valence × High intensity"
+        if r["X"] >= val_med and r["Y"] < int_med:
+            return "High valence × Low intensity"
+        if r["X"] < val_med and r["Y"] >= int_med:
+            return "Low valence × High intensity"
+        return "Low valence × Low intensity"
 
     df["Cluster"] = df.apply(q, axis=1)
-    return df, float(iso_med), float(int_med)
+    return df, float(val_med), float(int_med)
 
 # ============================================================
 # PLOTTING (Altair with bounded axes 1–5)
 # ============================================================
 def bounded_scatter(df: pd.DataFrame, color_col: str, title: str):
-    # Keep only points with X/Y in range (should already be 1–5, but just in case)
     df = df.copy()
     df["X"] = df["X"].clip(1, 5)
     df["Y"] = df["Y"].clip(1, 5)
 
     tooltip_cols = []
-    for col in ["team_name", "prompt", "n", "avg_iso", "avg_int", "avg_pain", "avg_rel", "X", "Y"]:
+    for col in ["team_name", "prompt", "n", "avg_valence", "avg_intensity", "X", "Y"]:
         if col in df.columns:
             tooltip_cols.append(col)
 
@@ -181,8 +174,8 @@ def bounded_scatter(df: pd.DataFrame, color_col: str, title: str):
         alt.Chart(df)
         .mark_circle(size=160)
         .encode(
-            x=alt.X("X:Q", scale=alt.Scale(domain=[1, 5]), title="Isolation (1–5)"),
-            y=alt.Y("Y:Q", scale=alt.Scale(domain=[1, 5]), title="Intensity (1–5)"),
+            x=alt.X("X:Q", scale=alt.Scale(domain=[1, 5]), title="Valence (1–5)"),
+            y=alt.Y("Y:Q", scale=alt.Scale(domain=[1, 5]), title="Emotional intensity (1–5)"),
             color=alt.Color(f"{color_col}:N", legend=alt.Legend(title=title)),
             tooltip=tooltip_cols
         )
@@ -214,23 +207,35 @@ with st.sidebar:
 # HEADER
 # ============================================================
 st.title("Engineering loneliness with GenAI")
-st.caption("Describe a moment of loneliness and encourage photorealistic, documentary-style prompting.")
+st.caption(
+    "Write a prompt for a photorealistic, documentary-style photograph. "
+    "Avoid illustration/CGI/cinematic language."
+)
 
 # ============================================================
 # CREATE
 # ============================================================
 if mode == "Create" and not is_host:
-    # If secrets missing, show a friendly error instead of crashing
     if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
         st.error("Missing Google API key. Set st.secrets['google_api']['key'] in your Streamlit secrets.")
         st.stop()
 
     client = genai.Client(api_key=st.secrets["google_api"]["key"])
 
+    st.markdown(
+        "**Prompt tips:** Start with *“Photorealistic documentary photograph…”*. "
+        "Specify a realistic moment, natural light, and a real-camera feel. "
+        "Avoid words like *cinematic*, *illustration*, *anime*, *render*."
+    )
+
     prompt = st.text_area(
         "Prompt",
-        height=160,
-        placeholder="Photorealistic documentary-style photograph..."
+        height=180,
+        placeholder=(
+            "Photorealistic documentary photograph. A candid moment: ... "
+            "Natural lighting, unposed, realistic skin texture. Shot on a smartphone. "
+            "No illustration, no CGI, no cinematic look."
+        )
     )
 
     if st.button("Generate image"):
@@ -249,7 +254,7 @@ if mode == "Create" and not is_host:
 
                 img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
                 if img_part is None:
-                    st.error("No image returned. Try again with a simpler prompt.")
+                    st.error("No image returned. Try again with a simpler, more literal prompt.")
                 else:
                     img = Image.open(BytesIO(img_part.inline_data.data))
                     st.session_state["draft"] = img
@@ -284,20 +289,17 @@ elif mode == "Rate" and not is_host:
             st.image(s["image"], use_container_width=True)
             st.caption(s["prompt"])
 
-            # Show vote count (helps participants feel progress)
             stats = vote_stats(s["id"])
             if stats["n"] > 0:
                 st.caption(f"Ratings so far: {int(stats['n'])}")
 
             with st.form(f"vote_{s['id']}"):
-                iso = st.slider("Isolation", 1, 5, 3, key=f"iso_{s['id']}")
-                inte = st.slider("Intensity", 1, 5, 3, key=f"inte_{s['id']}")
-                pain = st.slider("Pain", 1, 5, 3, key=f"pain_{s['id']}")
-                rel = st.slider("Relatability", 1, 5, 3, key=f"rel_{s['id']}")
+                valence = st.slider("Valence (negative → positive)", 1, 5, 3, key=f"val_{s['id']}")
+                intensity = st.slider("Emotional intensity (calm → intense)", 1, 5, 3, key=f"int_{s['id']}")
 
                 submitted = st.form_submit_button("Submit", disabled=voted)
                 if submitted:
-                    submit_vote(s["id"], participant_id, iso, inte, pain, rel)
+                    submit_vote(s["id"], participant_id, valence, intensity)
                     st.rerun()
 
             if voted:
@@ -335,8 +337,8 @@ elif mode == "Map (Quadrants)" and is_host:
                 "team_name": s["team_name"],
                 "prompt": s["prompt"],
                 **stats,
-                "X": float(stats["avg_iso"]),
-                "Y": float(stats["avg_int"])
+                "X": float(stats["avg_valence"]),
+                "Y": float(stats["avg_intensity"])
             })
 
     if len(rows) < 2:
@@ -344,10 +346,10 @@ elif mode == "Map (Quadrants)" and is_host:
         st.stop()
 
     df = pd.DataFrame(rows)
-    df, iso_split, int_split = add_quadrants(df)
+    df, val_split, int_split = add_quadrants(df)
 
     bounded_scatter(df, color_col="Cluster", title="Quadrant cluster")
-    st.caption(f"Isolation split = {iso_split:.2f} | Intensity split = {int_split:.2f}")
+    st.caption(f"Valence split = {val_split:.2f} | Intensity split = {int_split:.2f}")
 
 # ============================================================
 # MAP: KMEANS
@@ -364,8 +366,8 @@ elif mode == "Map (KMeans)" and is_host:
                 "team_name": s["team_name"],
                 "prompt": s["prompt"],
                 **stats,
-                "X": float(stats["avg_iso"]),
-                "Y": float(stats["avg_int"])
+                "X": float(stats["avg_valence"]),
+                "Y": float(stats["avg_intensity"])
             })
 
     if len(rows) < KMEANS_MIN_IMAGES:
@@ -407,4 +409,5 @@ elif mode == "Download" and is_host:
 
 else:
     st.info("Select a mode from the sidebar.")
+
 
