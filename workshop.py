@@ -209,7 +209,6 @@ with st.sidebar:
 st.title("Engineering loneliness with GenAI")
 st.caption(
     "Write a prompt for a photorealistic, documentary-style photograph. "
-    "Avoid illustration/CGI/cinematic language."
 )
 
 # ============================================================
@@ -231,8 +230,8 @@ if mode == "Create" and not is_host:
         "Prompt",
         height=180,
         placeholder=(
-            "Photorealistic documentary photograph. 3:2 aspct ratio ... "
-            "Natural lighting, unposed, realistic skin texture. Shot on a smartphone. "
+            "Photorealistic documentary photograph. 3:2 aspect ratio ... "
+            "Natural lighting. "
         )
     )
 
