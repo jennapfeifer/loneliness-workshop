@@ -225,16 +225,14 @@ if mode == "Create" and not is_host:
     st.markdown(
         "**Prompt tips:** Start with *“Photorealistic documentary photograph…”*. "
         "Specify a realistic moment, natural light, and a real-camera feel. "
-        "Avoid words like *cinematic*, *illustration*, *anime*, *render*."
     )
 
     prompt = st.text_area(
         "Prompt",
         height=180,
         placeholder=(
-            "Photorealistic documentary photograph. A candid moment: ... "
+            "Photorealistic documentary photograph. 3:2 aspct ratio ... "
             "Natural lighting, unposed, realistic skin texture. Shot on a smartphone. "
-            "No illustration, no CGI, no cinematic look."
         )
     )
 
