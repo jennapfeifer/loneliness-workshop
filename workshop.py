@@ -36,6 +36,24 @@ def get_conn():
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+def _table_exists(conn, name: str) -> bool:
+    r = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)
+    ).fetchone()
+    return r is not None
+
+def _columns(conn, table: str) -> list[str]:
+    return [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+def _find_free_backup_name(conn, base: str = "votes_old") -> str:
+    name = base
+    i = 1
+    while _table_exists(conn, name):
+        name = f"{base}_{i}"
+        i += 1
+    return name
+
 def init_db():
     with get_conn() as conn:
         c = conn.cursor()
@@ -49,14 +67,29 @@ def init_db():
         )
         """)
 
-        # NOTE: New schema: valence + intensity only
+        # ---- MIGRATION: if an old "votes" table exists with valence/intensity,
+        # rename it so we can create the new schema safely.
+        desired_cols = {
+            "id", "image_id", "participant_id",
+            "loneliness", "recognizable", "relatable",
+            "created_at"
+        }
+
+        if _table_exists(conn, "votes"):
+            cols = set(_columns(conn, "votes"))
+            if cols != desired_cols:
+                backup = _find_free_backup_name(conn, "votes_old")
+                conn.execute(f"ALTER TABLE votes RENAME TO {backup};")
+
+        # New schema: loneliness + recognizability + relatability (all 1–5)
         c.execute("""
         CREATE TABLE IF NOT EXISTS votes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             image_id INTEGER NOT NULL,
             participant_id TEXT NOT NULL,
-            valence INTEGER NOT NULL,
-            intensity INTEGER NOT NULL,
+            loneliness INTEGER NOT NULL,
+            recognizable INTEGER NOT NULL,
+            relatable INTEGER NOT NULL,
             created_at TEXT DEFAULT (datetime('now')),
             UNIQUE(image_id, participant_id)
         )
@@ -101,17 +134,18 @@ def get_submissions():
         out.append(d)
     return out
 
-def submit_vote(image_id: int, pid: str, valence: int, intensity: int):
+def submit_vote(image_id: int, pid: str, loneliness: int, recognizable: int, relatable: int):
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("""
-        INSERT INTO votes (image_id, participant_id, valence, intensity)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO votes (image_id, participant_id, loneliness, recognizable, relatable)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(image_id, participant_id) DO UPDATE SET
-            valence=excluded.valence,
-            intensity=excluded.intensity,
+            loneliness=excluded.loneliness,
+            recognizable=excluded.recognizable,
+            relatable=excluded.relatable,
             created_at=datetime('now')
-        """, (image_id, pid, valence, intensity))
+        """, (image_id, pid, loneliness, recognizable, relatable))
         conn.commit()
 
 def vote_stats(image_id: int):
@@ -119,14 +153,15 @@ def vote_stats(image_id: int):
         c = conn.cursor()
         c.execute("""
         SELECT COUNT(*) n,
-               AVG(valence) avg_valence,
-               AVG(intensity) avg_intensity
+               AVG(loneliness)   avg_loneliness,
+               AVG(recognizable) avg_recognizable,
+               AVG(relatable)    avg_relatable
         FROM votes WHERE image_id=?
         """, (image_id,))
         r = c.fetchone()
 
     if not r or r["n"] == 0:
-        return dict(n=0, avg_valence=0.0, avg_intensity=0.0)
+        return dict(n=0, avg_loneliness=0.0, avg_recognizable=0.0, avg_relatable=0.0)
     return dict(r)
 
 def has_voted(image_id: int, pid: str) -> bool:
@@ -139,46 +174,62 @@ def has_voted(image_id: int, pid: str) -> bool:
         return c.fetchone() is not None
 
 # ============================================================
-# CLUSTERING
+# CLUSTERING / QUADRANTS
 # ============================================================
 def add_quadrants(df: pd.DataFrame):
-    val_med = df["X"].median()
-    int_med = df["Y"].median()
+    lon_med = df["X"].median()
+    rec_med = df["Y"].median()
 
     def q(r):
-        if r["X"] >= val_med and r["Y"] >= int_med:
-            return "High valence × High intensity"
-        if r["X"] >= val_med and r["Y"] < int_med:
-            return "High valence × Low intensity"
-        if r["X"] < val_med and r["Y"] >= int_med:
-            return "Low valence × High intensity"
-        return "Low valence × Low intensity"
+        if r["X"] >= lon_med and r["Y"] >= rec_med:
+            return "High loneliness × High recognizability"
+        if r["X"] >= lon_med and r["Y"] < rec_med:
+            return "High loneliness × Low recognizability"
+        if r["X"] < lon_med and r["Y"] >= rec_med:
+            return "Low loneliness × High recognizability"
+        return "Low loneliness × Low recognizability"
 
     df["Cluster"] = df.apply(q, axis=1)
-    return df, float(val_med), float(int_med)
+    return df, float(lon_med), float(rec_med)
 
 # ============================================================
 # PLOTTING (Altair with bounded axes 1–5)
+# - X: Avg loneliness present
+# - Y: Avg recognizability
+# - Size: Avg relatability (optional)
 # ============================================================
-def bounded_scatter(df: pd.DataFrame, color_col: str, title: str):
+def bounded_scatter(df: pd.DataFrame, color_col: str, title: str, size_col: str | None = None):
     df = df.copy()
     df["X"] = df["X"].clip(1, 5)
     df["Y"] = df["Y"].clip(1, 5)
 
     tooltip_cols = []
-    for col in ["team_name", "prompt", "n", "avg_valence", "avg_intensity", "X", "Y"]:
+    for col in [
+        "team_name", "prompt", "n",
+        "avg_loneliness", "avg_recognizable", "avg_relatable",
+        "X", "Y"
+    ]:
         if col in df.columns:
             tooltip_cols.append(col)
 
+    enc = {
+        "x": alt.X("X:Q", scale=alt.Scale(domain=[1, 5]), title="Loneliness present (avg, 1–5)"),
+        "y": alt.Y("Y:Q", scale=alt.Scale(domain=[1, 5]), title="Recognizable student-life loneliness (avg, 1–5)"),
+        "color": alt.Color(f"{color_col}:N", legend=alt.Legend(title=title)),
+        "tooltip": tooltip_cols
+    }
+
+    if size_col and size_col in df.columns:
+        enc["size"] = alt.Size(
+            f"{size_col}:Q",
+            legend=alt.Legend(title="Relatability (avg)"),
+            scale=alt.Scale(domain=[1, 5])
+        )
+
     chart = (
         alt.Chart(df)
-        .mark_circle(size=160)
-        .encode(
-            x=alt.X("X:Q", scale=alt.Scale(domain=[1, 5]), title="Valence (1–5)"),
-            y=alt.Y("Y:Q", scale=alt.Scale(domain=[1, 5]), title="Emotional intensity (1–5)"),
-            color=alt.Color(f"{color_col}:N", legend=alt.Legend(title=title)),
-            tooltip=tooltip_cols
-        )
+        .mark_circle(opacity=0.9)
+        .encode(**enc)
         .properties(height=520)
         .interactive()
     )
@@ -207,9 +258,7 @@ with st.sidebar:
 # HEADER
 # ============================================================
 st.title("Engineering loneliness with GenAI")
-st.caption(
-    "Write a prompt for a photorealistic, documentary-style photograph. "
-)
+st.caption("Write a prompt for a photorealistic, documentary-style photograph.")
 
 # ============================================================
 # CREATE
@@ -223,7 +272,7 @@ if mode == "Create" and not is_host:
 
     st.markdown(
         "**Prompt tips:** Start with *“Photorealistic documentary photograph…”*. "
-        "Specify a realistic moment, natural light, and a real-camera feel. "
+        "Specify a realistic moment, natural light, and a real-camera feel."
     )
 
     prompt = st.text_area(
@@ -291,12 +340,22 @@ elif mode == "Rate" and not is_host:
                 st.caption(f"Ratings so far: {int(stats['n'])}")
 
             with st.form(f"vote_{s['id']}"):
-                valence = st.slider("Valence (negative → positive)", 1, 5, 3, key=f"val_{s['id']}")
-                intensity = st.slider("Emotional intensity (calm → intense)", 1, 5, 3, key=f"int_{s['id']}")
+                loneliness = st.slider(
+                    "How much loneliness is present in this image?",
+                    1, 5, 3, key=f"lon_{s['id']}"
+                )
+                recognizable = st.slider(
+                    "How recognizable is this as student-life loneliness?",
+                    1, 5, 3, key=f"rec_{s['id']}"
+                )
+                relatable = st.slider(
+                    "How much do you relate to this image?",
+                    1, 5, 3, key=f"rel_{s['id']}"
+                )
 
                 submitted = st.form_submit_button("Submit", disabled=voted)
                 if submitted:
-                    submit_vote(s["id"], participant_id, valence, intensity)
+                    submit_vote(s["id"], participant_id, loneliness, recognizable, relatable)
                     st.rerun()
 
             if voted:
@@ -321,6 +380,9 @@ elif mode == "Gallery" and is_host:
 
 # ============================================================
 # MAP: QUADRANTS
+# - X = avg_loneliness
+# - Y = avg_recognizable
+# - point size = avg_relatable
 # ============================================================
 elif mode == "Map (Quadrants)" and is_host:
     subs = get_submissions()
@@ -334,8 +396,8 @@ elif mode == "Map (Quadrants)" and is_host:
                 "team_name": s["team_name"],
                 "prompt": s["prompt"],
                 **stats,
-                "X": float(stats["avg_valence"]),
-                "Y": float(stats["avg_intensity"])
+                "X": float(stats["avg_loneliness"]),
+                "Y": float(stats["avg_recognizable"]),
             })
 
     if len(rows) < 2:
@@ -343,13 +405,15 @@ elif mode == "Map (Quadrants)" and is_host:
         st.stop()
 
     df = pd.DataFrame(rows)
-    df, val_split, int_split = add_quadrants(df)
+    df, lon_split, rec_split = add_quadrants(df)
 
-    bounded_scatter(df, color_col="Cluster", title="Quadrant cluster")
-    st.caption(f"Valence split = {val_split:.2f} | Intensity split = {int_split:.2f}")
+    bounded_scatter(df, color_col="Cluster", title="Quadrant cluster", size_col="avg_relatable")
+    st.caption(f"Loneliness split = {lon_split:.2f} | Recognizability split = {rec_split:.2f}")
 
 # ============================================================
 # MAP: KMEANS
+# - Cluster on 3D: (avg_loneliness, avg_recognizable, avg_relatable)
+# - Plot 2D: loneliness vs recognizability; size shows relatability
 # ============================================================
 elif mode == "Map (KMeans)" and is_host:
     subs = get_submissions()
@@ -363,8 +427,9 @@ elif mode == "Map (KMeans)" and is_host:
                 "team_name": s["team_name"],
                 "prompt": s["prompt"],
                 **stats,
-                "X": float(stats["avg_valence"]),
-                "Y": float(stats["avg_intensity"])
+                "X": float(stats["avg_loneliness"]),
+                "Y": float(stats["avg_recognizable"]),
+                "Z": float(stats["avg_relatable"]),
             })
 
     if len(rows) < KMEANS_MIN_IMAGES:
@@ -373,9 +438,9 @@ elif mode == "Map (KMeans)" and is_host:
 
     df = pd.DataFrame(rows)
     km = KMeans(n_clusters=KMEANS_K, random_state=42, n_init=10)
-    df["Cluster"] = km.fit_predict(df[["X", "Y"]]).astype(str)
+    df["Cluster"] = km.fit_predict(df[["X", "Y", "Z"]]).astype(str)
 
-    bounded_scatter(df, color_col="Cluster", title="KMeans cluster")
+    bounded_scatter(df, color_col="Cluster", title="KMeans cluster", size_col="avg_relatable")
 
 # ============================================================
 # DOWNLOAD
@@ -406,5 +471,3 @@ elif mode == "Download" and is_host:
 
 else:
     st.info("Select a mode from the sidebar.")
-
-
