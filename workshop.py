@@ -258,7 +258,10 @@ with st.sidebar:
 # HEADER
 # ============================================================
 st.title("Engineering loneliness with GenAI")
-st.caption("Write a prompt for a photorealistic, documentary-style photograph.")
+
+# Only show the subtitle when participants are creating prompts/images
+if mode == "Create" and not is_host:
+    st.caption("Write a prompt for a photorealistic, documentary-style photograph.")
 
 # ============================================================
 # CREATE
@@ -333,7 +336,6 @@ elif mode == "Rate" and not is_host:
 
         with cols[i % 3]:
             st.image(s["image"], use_container_width=True)
-            st.caption(s["prompt"])
 
             stats = vote_stats(s["id"])
             if stats["n"] > 0:
@@ -375,8 +377,8 @@ elif mode == "Gallery" and is_host:
         stats = vote_stats(s["id"])
         with cols[i % 3]:
             st.image(s["image"], use_container_width=True)
-            st.caption(s["prompt"])
             st.caption(f"Ratings: {int(stats['n'])}")
+
 
 # ============================================================
 # MAP: QUADRANTS
