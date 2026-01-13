@@ -293,7 +293,7 @@ if mode == "Create" and not is_host:
         else:
             with st.spinner("Generating…"):
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash-image",
+                    model="gemini-3-pro-image-preview",
                     contents=[prompt],
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE"],
