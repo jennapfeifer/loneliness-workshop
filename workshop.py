@@ -133,12 +133,18 @@ def shared_runtime():
 def get_gemini_client():
     return genai.Client(api_key=st.secrets["google_api"]["key"])
 
-def _generate_image_bytes(prompt: str) -> bytes:
-    client = get_gemini_client()
-    executor, sem, lock, jobs = shared_runtime()
+_thread_local = threading.local()
 
+def _get_thread_client(api_key: str):
+    # One client per worker thread (fast + avoids thread-safety issues)
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = genai.Client(api_key=api_key)
+    return _thread_local.client
+
+def _generate_image_bytes(prompt: str, api_key: str, sem: threading.Semaphore) -> bytes:
     sem.acquire()
     try:
+        client = _get_thread_client(api_key)
         response = client.models.generate_content(
             model="gemini-2.5-flash-image",
             contents=[prompt],
@@ -326,7 +332,7 @@ if mode == "Create" and not is_host:
         st.error("Missing Google API key. Set st.secrets['google_api']['key'] in your Streamlit secrets.")
         st.stop()
 
-    client = genai.Client(api_key=st.secrets["google_api"]["key"])
+    api_key = st.secrets["google_api"]["key"]
 
     st.markdown(
         "**Prompt tips:** Start with *“Photorealistic documentary photograph…”*. "
@@ -341,52 +347,63 @@ if mode == "Create" and not is_host:
             "Natural lighting. "
         )
     )
-_cleanup_old_jobs()
 
-# Show some queue info (optional but nice in workshops)
-executor, sem, lock, jobs = shared_runtime()
-with lock:
-    pending = sum(1 for j in jobs.values() if not j.future.done())
-st.caption(f"Generator queue: {pending} pending")
+    _cleanup_old_jobs()
 
-if st.button("Generate image"):
-    if not prompt.strip():
-        st.warning("Please write a prompt.")
-    else:
-        job_id = str(uuid.uuid4())
-        fut = executor.submit(_generate_image_bytes, prompt)
-
-        with lock:
-            jobs[job_id] = Job(future=fut, submitted_at=time.time())
-
-        st.session_state["job_id"] = job_id
-        st.session_state.pop("draft", None)
-        st.toast("Queued! You can keep editing while it generates.")
-
-job_id = st.session_state.get("job_id")
-if job_id:
+    # Queue info
+    executor, sem, lock, jobs = shared_runtime()
     with lock:
-        job = jobs.get(job_id)
+        pending = sum(1 for j in jobs.values() if not j.future.done())
+    st.caption(f"Generator queue: {pending} pending")
 
-    if job is None:
-        st.session_state.pop("job_id", None)
-    elif job.future.done():
-        try:
-            data = job.future.result()
-            img = Image.open(BytesIO(data))
-            st.session_state["draft"] = img
-            st.image(img, use_container_width=True)
-        except Exception as e:
-            st.error(f"Generation failed: {e}")
-        finally:
+    if st.button("Generate image"):
+        if not prompt.strip():
+            st.warning("Please write a prompt.")
+        else:
+            job_id = str(uuid.uuid4())
+            st.session_state["job_id"] = job_id
+            st.session_state["job_submitted_at"] = time.time()
+            st.session_state.pop("draft", None)
+
+            fut = executor.submit(_generate_image_bytes, prompt, api_key, sem)
             with lock:
-                jobs.pop(job_id, None)
-            st.session_state.pop("job_id", None)
-    else:
-        st.info("Generating in the background…")
-        if st.button("Refresh status"):
-            st.rerun()
+                jobs[job_id] = Job(future=fut, submitted_at=time.time())
 
+            st.toast("Queued! (Click Refresh if it doesn't update)")
+
+    job_id = st.session_state.get("job_id")
+    if job_id:
+        with lock:
+            job = jobs.get(job_id)
+
+        if job is None:
+            st.session_state.pop("job_id", None)
+
+        elif job.future.done():
+            try:
+                data = job.future.result()
+                img = Image.open(BytesIO(data))
+                st.session_state["draft"] = img
+                st.image(img, use_container_width=True)
+
+                elapsed = time.time() - st.session_state.get("job_submitted_at", time.time())
+                st.caption(f"✅ Generated in {elapsed:.1f}s")
+
+            except Exception as e:
+                st.error(f"Generation failed: {e}")
+
+            finally:
+                with lock:
+                    jobs.pop(job_id, None)
+                st.session_state.pop("job_id", None)
+
+        else:
+            elapsed = time.time() - st.session_state.get("job_submitted_at", time.time())
+            st.info(f"Generating in the background… ({elapsed:.1f}s)")
+            if st.button("Refresh status"):
+                st.rerun()
+
+    # IMPORTANT: Submit should be OUTSIDE the job_id block
     if "draft" in st.session_state:
         if st.button("Submit image"):
             save_submission(team_name or "Anonymous", prompt, st.session_state["draft"])
