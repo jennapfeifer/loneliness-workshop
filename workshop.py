@@ -130,15 +130,16 @@ def shared_runtime():
     return executor, sem, lock, jobs
 
 @st.cache_resource
-def get_gemini_client():
-    return genai.Client(api_key=st.secrets["google_api"]["key"])
-
 _thread_local = threading.local()
 
 def _get_thread_client(api_key: str):
-    # One client per worker thread (fast + avoids thread-safety issues)
+    # One client per worker thread
     if not hasattr(_thread_local, "client"):
-        _thread_local.client = genai.Client(api_key=api_key)
+        http_options = types.HttpOptions(
+            # httpx.Client args; timeout is in seconds
+            client_args={"timeout": 60.0}
+        )
+        _thread_local.client = genai.Client(api_key=api_key, http_options=http_options)
     return _thread_local.client
 
 def _generate_image_bytes(prompt: str, api_key: str, sem: threading.Semaphore) -> bytes:
@@ -153,9 +154,11 @@ def _generate_image_bytes(prompt: str, api_key: str, sem: threading.Semaphore) -
                 image_config=types.ImageConfig(aspect_ratio="3:2"),
             ),
         )
+
         img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
         if img_part is None:
             raise RuntimeError("No image returned (response had no inline_data).")
+
         return img_part.inline_data.data
     finally:
         sem.release()
@@ -339,77 +342,74 @@ if mode == "Create" and not is_host:
         "Specify a realistic moment, natural light, and a real-camera feel."
     )
 
-    prompt = st.text_area(
-        "Prompt",
-        height=180,
-        placeholder=(
-            "Photorealistic documentary photograph. 3:2 aspect ratio ... "
-            "Natural lighting. "
-        )
-    )
+    prompt = st.text_area("Prompt", height=180)
 
-    _cleanup_old_jobs()
-
-    # Queue info
+    # shared resources
     executor, sem, lock, jobs = shared_runtime()
-    with lock:
-        pending = sum(1 for j in jobs.values() if not j.future.done())
-    st.caption(f"Generator queue: {pending} pending")
 
-    if st.button("Generate image"):
+    # submit job
+    if st.button("Generate image", key="gen_btn"):
         if not prompt.strip():
             st.warning("Please write a prompt.")
         else:
             job_id = str(uuid.uuid4())
             st.session_state["job_id"] = job_id
-            st.session_state["job_submitted_at"] = time.time()
+            st.session_state["job_started"] = time.time()
             st.session_state.pop("draft", None)
 
             fut = executor.submit(_generate_image_bytes, prompt, api_key, sem)
             with lock:
                 jobs[job_id] = Job(future=fut, submitted_at=time.time())
 
-            st.toast("Queued! (Click Refresh if it doesn't update)")
+    # --- auto-polling fragment (reruns every 1s while session is active)
+    try:
+        fragment = st.fragment
+    except AttributeError:
+        fragment = st.experimental_fragment  # older Streamlit
 
-    job_id = st.session_state.get("job_id")
-    if job_id:
+    @fragment(run_every=1)
+    def poll_job():
+        job_id = st.session_state.get("job_id")
+        if not job_id:
+            return
+
         with lock:
             job = jobs.get(job_id)
 
         if job is None:
             st.session_state.pop("job_id", None)
+            st.error("Job disappeared (server restarted or multiple instances). Try again.")
+            return
 
-        elif job.future.done():
-            try:
-                data = job.future.result()
+        fut = job.future
+        elapsed = time.time() - st.session_state.get("job_started", time.time())
+
+        # Show debug state so we can see what's happening
+        st.caption(f"Job {job_id[:8]}… | running={fut.running()} | done={fut.done()} | {elapsed:.1f}s elapsed")
+
+        if fut.done():
+            exc = fut.exception()
+            if exc:
+                st.error(f"Generation failed: {exc}")
+            else:
+                data = fut.result()
                 img = Image.open(BytesIO(data))
                 st.session_state["draft"] = img
                 st.image(img, use_container_width=True)
 
-                elapsed = time.time() - st.session_state.get("job_submitted_at", time.time())
-                st.caption(f"✅ Generated in {elapsed:.1f}s")
+            with lock:
+                jobs.pop(job_id, None)
+            st.session_state.pop("job_id", None)
 
-            except Exception as e:
-                st.error(f"Generation failed: {e}")
+    poll_job()
 
-            finally:
-                with lock:
-                    jobs.pop(job_id, None)
-                st.session_state.pop("job_id", None)
-
-        else:
-            elapsed = time.time() - st.session_state.get("job_submitted_at", time.time())
-            st.info(f"Generating in the background… ({elapsed:.1f}s)")
-            if st.button("Refresh status"):
-                st.rerun()
-
-    # IMPORTANT: Submit should be OUTSIDE the job_id block
     if "draft" in st.session_state:
-        if st.button("Submit image"):
+        if st.button("Submit image", key="submit_btn"):
             save_submission(team_name or "Anonymous", prompt, st.session_state["draft"])
             del st.session_state["draft"]
             st.success("Saved.")
             st.rerun()
+
 
 # ============================================================
 # RATE
