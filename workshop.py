@@ -2,7 +2,7 @@ import time
 import uuid
 import threading
 import concurrent.futures
-from dataclasses import dataclass
+from dataclasses import dataclass  # (not used now, but fine to keep)
 
 import streamlit as st
 import altair as alt
@@ -31,6 +31,14 @@ HOST_PASSWORD = "admin123"
 MIN_RATINGS_FOR_MAP = 1
 KMEANS_K = 4
 KMEANS_MIN_IMAGES = 12
+
+# Limit concurrent Gemini calls across ALL users on this Streamlit instance.
+# Tune this based on your quota + server size.
+MAX_CONCURRENT_GEN = 8
+
+@st.cache_resource
+def global_gen_semaphore():
+    return threading.BoundedSemaphore(MAX_CONCURRENT_GEN)
 
 # ============================================================
 # DATABASE
@@ -113,31 +121,18 @@ def blob_to_image(blob: bytes) -> Image.Image:
     return Image.open(BytesIO(blob))
 
 # ============================================================
-# JOB QUEUE + GEMINI WORKER
+# GEMINI HELPERS (thread-safe-ish)
 # ============================================================
-@dataclass
-class Job:
-    future: concurrent.futures.Future
-    submitted_at: float
-
-@st.cache_resource
-def shared_runtime():
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)  # tune 2–6
-    sem = threading.BoundedSemaphore(4)  # throttle Gemini concurrency
-    lock = threading.Lock()
-    jobs: dict[str, Job] = {}
-    return executor, sem, lock, jobs
-
-# IMPORTANT: thread-local must NOT be decorated
 _thread_local = threading.local()
 
 def _get_thread_client(api_key: str):
-    # One Gemini client per worker thread
+    # One client per worker thread.
     if not hasattr(_thread_local, "client"):
         _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
 
-def _generate_image_bytes(prompt: str, api_key: str, sem: threading.Semaphore) -> bytes:
+def _generate_image_bytes(prompt: str, api_key: str) -> bytes:
+    sem = global_gen_semaphore()
     sem.acquire()
     try:
         client = _get_thread_client(api_key)
@@ -146,23 +141,23 @@ def _generate_image_bytes(prompt: str, api_key: str, sem: threading.Semaphore) -
             contents=[prompt],
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio="3:2"),
-            ),
+                image_config=types.ImageConfig(aspect_ratio="3:2")
+            )
         )
         img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
         if img_part is None:
-            raise RuntimeError("No image returned (response had no inline_data).")
-        return img_part.inline_data.data
+            raise RuntimeError("No image returned. Try a simpler, more literal prompt.")
+        data = img_part.inline_data.data
+
+        # Defensive: make sure we got bytes
+        if isinstance(data, str):
+            # Some SDKs might return base64 as str; most return bytes.
+            # If this happens, fail loudly so you see the real issue.
+            raise RuntimeError("Gemini returned image data as str (expected bytes). Check SDK version/response parsing.")
+
+        return data
     finally:
         sem.release()
-
-def _cleanup_old_jobs(max_age_s: int = 600):
-    executor, sem, lock, jobs = shared_runtime()
-    now = time.time()
-    with lock:
-        for jid, job in list(jobs.items()):
-            if job.future.done() or (now - job.submitted_at) > max_age_s:
-                jobs.pop(jid, None)
 
 # ============================================================
 # DB OPERATIONS
@@ -324,6 +319,10 @@ if mode == "Create" and not is_host:
 
     api_key = st.secrets["google_api"]["key"]
 
+    # One executor per SESSION (this is the reliable part)
+    if "executor" not in st.session_state:
+        st.session_state["executor"] = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
     st.markdown(
         "**Prompt tips:** Start with *“Photorealistic documentary photograph…”*. "
         "Specify a realistic moment, natural light, and a real-camera feel."
@@ -331,84 +330,62 @@ if mode == "Create" and not is_host:
 
     prompt = st.text_area("Prompt", height=180)
 
-    executor, sem, lock, jobs = shared_runtime()
-    _cleanup_old_jobs()
+    auto_refresh = st.checkbox("Auto-refresh while generating", value=True)
 
-    with lock:
-        pending = sum(1 for j in jobs.values() if not j.future.done())
-    st.caption(f"Generator queue: {pending} pending")
-
+    # Start generation
     if st.button("Generate image", key="gen_btn"):
         if not prompt.strip():
             st.warning("Please write a prompt.")
         else:
-            job_id = str(uuid.uuid4())
-            st.session_state["job_id"] = job_id
-            st.session_state["job_started"] = time.time()
-            st.session_state["job_prompt"] = prompt  # store prompt used for this job
+            # Prevent double-submits while one is running
+            fut = st.session_state.get("gen_future")
+            if fut is not None and not fut.done():
+                st.warning("Already generating… please wait.")
+            else:
+                st.session_state["job_started"] = time.time()
+                st.session_state["job_prompt"] = prompt
+                st.session_state.pop("draft_bytes", None)
+                st.session_state.pop("gen_error", None)
 
-            # Clear previous draft
-            st.session_state.pop("draft_bytes", None)
-            st.session_state.pop("draft_prompt", None)
+                st.session_state["gen_future"] = st.session_state["executor"].submit(
+                    _generate_image_bytes, prompt, api_key
+                )
 
-            fut = executor.submit(_generate_image_bytes, prompt, api_key, sem)
-            with lock:
-                jobs[job_id] = Job(future=fut, submitted_at=time.time())
-
-    # --- auto-polling fragment (reruns every 1s while session is active)
-    try:
-        fragment = st.fragment
-    except AttributeError:
-        fragment = st.experimental_fragment  # older Streamlit
-
-    @fragment(run_every=1)
-    def poll_job():
-        job_id = st.session_state.get("job_id")
-        if not job_id:
-            return
-
-        with lock:
-            job = jobs.get(job_id)
-
-        if job is None:
-            st.session_state.pop("job_id", None)
-            st.error("Job disappeared (server restarted or multiple instances). Try again.")
-            return
-
-        fut = job.future
-        elapsed = time.time() - st.session_state.get("job_started", time.time())
-        st.caption(f"Job {job_id[:8]}… running={fut.running()} done={fut.done()} ({elapsed:.1f}s)")
-
+    # Poll generation
+    fut = st.session_state.get("gen_future")
+    if fut is not None:
         if fut.done():
             try:
-                exc = fut.exception()
-                if exc:
-                    st.error(f"Generation failed: {exc}")
-                else:
-                    data = fut.result()
-                    # Store bytes in session state; render OUTSIDE fragment
-                    st.session_state["draft_bytes"] = data
-                    st.session_state["draft_prompt"] = st.session_state.get("job_prompt", "")
+                data = fut.result()
+                st.session_state["draft_bytes"] = data
+            except Exception as e:
+                st.session_state["gen_error"] = str(e)
             finally:
-                with lock:
-                    jobs.pop(job_id, None)
-                st.session_state.pop("job_id", None)
+                st.session_state.pop("gen_future", None)
 
-    poll_job()
+        else:
+            elapsed = time.time() - st.session_state.get("job_started", time.time())
+            st.info(f"Generating… ({elapsed:.1f}s)")
+            if auto_refresh:
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                if st.button("Check status"):
+                    st.rerun()
 
-    # Always render the draft image outside the fragment (so it persists)
+    # Show any error
+    if st.session_state.get("gen_error"):
+        st.error(f"Generation failed: {st.session_state['gen_error']}")
+
+    # Always display the generated image if we have it
     if "draft_bytes" in st.session_state:
         img = Image.open(BytesIO(st.session_state["draft_bytes"]))
         st.image(img, use_container_width=True)
 
         if st.button("Submit image", key="submit_btn"):
-            used_prompt = st.session_state.get("draft_prompt", prompt) or prompt
+            used_prompt = st.session_state.get("job_prompt", prompt) or prompt
             save_submission(team_name or "Anonymous", used_prompt, img)
-
             st.session_state.pop("draft_bytes", None)
-            st.session_state.pop("draft_prompt", None)
-            st.session_state.pop("job_prompt", None)
-
             st.success("Saved.")
             st.rerun()
 
@@ -563,4 +540,3 @@ elif mode == "Download" and is_host:
 
 else:
     st.info("Select a mode from the sidebar.")
-
