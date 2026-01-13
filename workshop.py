@@ -1,3 +1,9 @@
+import time
+import uuid
+import threading
+import concurrent.futures
+from dataclasses import dataclass
+
 import streamlit as st
 import altair as alt
 
@@ -108,6 +114,55 @@ def image_to_blob(image: Image.Image) -> bytes:
 
 def blob_to_image(blob: bytes) -> Image.Image:
     return Image.open(BytesIO(blob))
+
+@dataclass
+class Job:
+    future: concurrent.futures.Future
+    submitted_at: float
+
+@st.cache_resource
+def shared_runtime():
+    # One shared pool for the whole Streamlit process (all users)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)  # tune: 2–6
+    sem = threading.BoundedSemaphore(4)  # max concurrent Gemini calls (same as max_workers usually)
+    lock = threading.Lock()
+    jobs: dict[str, Job] = {}
+    return executor, sem, lock, jobs
+
+@st.cache_resource
+def get_gemini_client():
+    return genai.Client(api_key=st.secrets["google_api"]["key"])
+
+def _generate_image_bytes(prompt: str) -> bytes:
+    client = get_gemini_client()
+    executor, sem, lock, jobs = shared_runtime()
+
+    sem.acquire()
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(aspect_ratio="3:2"),
+            ),
+        )
+        img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
+        if img_part is None:
+            raise RuntimeError("No image returned (response had no inline_data).")
+        return img_part.inline_data.data
+    finally:
+        sem.release()
+
+def _cleanup_old_jobs(max_age_s: int = 600):
+    """Prevent memory leaks if someone closes the tab mid-job."""
+    executor, sem, lock, jobs = shared_runtime()
+    now = time.time()
+    with lock:
+        for jid, job in list(jobs.items()):
+            if job.future.done() or (now - job.submitted_at) > max_age_s:
+                jobs.pop(jid, None)
+
 
 # ============================================================
 # DB OPERATIONS
@@ -286,28 +341,51 @@ if mode == "Create" and not is_host:
             "Natural lighting. "
         )
     )
+_cleanup_old_jobs()
 
-    if st.button("Generate image"):
-        if not prompt.strip():
-            st.warning("Please write a prompt.")
-        else:
-            with st.spinner("Generating…"):
-                response = client.models.generate_content(
-                    model="gemini-3-pro-image-preview",
-                    contents=[prompt],
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio="3:2")
-                    )
-                )
+# Show some queue info (optional but nice in workshops)
+executor, sem, lock, jobs = shared_runtime()
+with lock:
+    pending = sum(1 for j in jobs.values() if not j.future.done())
+st.caption(f"Generator queue: {pending} pending")
 
-                img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
-                if img_part is None:
-                    st.error("No image returned. Try again with a simpler, more literal prompt.")
-                else:
-                    img = Image.open(BytesIO(img_part.inline_data.data))
-                    st.session_state["draft"] = img
-                    st.image(img, use_container_width=True)
+if st.button("Generate image"):
+    if not prompt.strip():
+        st.warning("Please write a prompt.")
+    else:
+        job_id = str(uuid.uuid4())
+        fut = executor.submit(_generate_image_bytes, prompt)
+
+        with lock:
+            jobs[job_id] = Job(future=fut, submitted_at=time.time())
+
+        st.session_state["job_id"] = job_id
+        st.session_state.pop("draft", None)
+        st.toast("Queued! You can keep editing while it generates.")
+
+job_id = st.session_state.get("job_id")
+if job_id:
+    with lock:
+        job = jobs.get(job_id)
+
+    if job is None:
+        st.session_state.pop("job_id", None)
+    elif job.future.done():
+        try:
+            data = job.future.result()
+            img = Image.open(BytesIO(data))
+            st.session_state["draft"] = img
+            st.image(img, use_container_width=True)
+        except Exception as e:
+            st.error(f"Generation failed: {e}")
+        finally:
+            with lock:
+                jobs.pop(job_id, None)
+            st.session_state.pop("job_id", None)
+    else:
+        st.info("Generating in the background…")
+        if st.button("Refresh status"):
+            st.rerun()
 
     if "draft" in st.session_state:
         if st.button("Submit image"):
