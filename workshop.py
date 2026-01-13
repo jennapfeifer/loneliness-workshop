@@ -122,7 +122,6 @@ class Job:
 
 @st.cache_resource
 def shared_runtime():
-    # Shared across all sessions in this Streamlit process
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)  # tune 2–6
     sem = threading.BoundedSemaphore(4)  # throttle Gemini concurrency
     lock = threading.Lock()
@@ -133,7 +132,7 @@ def shared_runtime():
 _thread_local = threading.local()
 
 def _get_thread_client(api_key: str):
-    # Create one Gemini client per worker thread (safe + fast)
+    # One Gemini client per worker thread
     if not hasattr(_thread_local, "client"):
         _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
@@ -346,17 +345,21 @@ if mode == "Create" and not is_host:
             job_id = str(uuid.uuid4())
             st.session_state["job_id"] = job_id
             st.session_state["job_started"] = time.time()
-            st.session_state.pop("draft", None)
+            st.session_state["job_prompt"] = prompt  # store prompt used for this job
+
+            # Clear previous draft
+            st.session_state.pop("draft_bytes", None)
+            st.session_state.pop("draft_prompt", None)
 
             fut = executor.submit(_generate_image_bytes, prompt, api_key, sem)
             with lock:
                 jobs[job_id] = Job(future=fut, submitted_at=time.time())
 
-    # Auto-poll the job (reruns every second)
+    # --- auto-polling fragment (reruns every 1s while session is active)
     try:
         fragment = st.fragment
     except AttributeError:
-        fragment = st.experimental_fragment  # older streamlit
+        fragment = st.experimental_fragment  # older Streamlit
 
     @fragment(run_every=1)
     def poll_job():
@@ -377,25 +380,35 @@ if mode == "Create" and not is_host:
         st.caption(f"Job {job_id[:8]}… running={fut.running()} done={fut.done()} ({elapsed:.1f}s)")
 
         if fut.done():
-            exc = fut.exception()
-            if exc:
-                st.error(f"Generation failed: {exc}")
-            else:
-                data = fut.result()
-                img = Image.open(BytesIO(data))
-                st.session_state["draft"] = img
-                st.image(img, use_container_width=True)
-
-            with lock:
-                jobs.pop(job_id, None)
-            st.session_state.pop("job_id", None)
+            try:
+                exc = fut.exception()
+                if exc:
+                    st.error(f"Generation failed: {exc}")
+                else:
+                    data = fut.result()
+                    # Store bytes in session state; render OUTSIDE fragment
+                    st.session_state["draft_bytes"] = data
+                    st.session_state["draft_prompt"] = st.session_state.get("job_prompt", "")
+            finally:
+                with lock:
+                    jobs.pop(job_id, None)
+                st.session_state.pop("job_id", None)
 
     poll_job()
 
-    if "draft" in st.session_state:
+    # Always render the draft image outside the fragment (so it persists)
+    if "draft_bytes" in st.session_state:
+        img = Image.open(BytesIO(st.session_state["draft_bytes"]))
+        st.image(img, use_container_width=True)
+
         if st.button("Submit image", key="submit_btn"):
-            save_submission(team_name or "Anonymous", prompt, st.session_state["draft"])
-            del st.session_state["draft"]
+            used_prompt = st.session_state.get("draft_prompt", prompt) or prompt
+            save_submission(team_name or "Anonymous", used_prompt, img)
+
+            st.session_state.pop("draft_bytes", None)
+            st.session_state.pop("draft_prompt", None)
+            st.session_state.pop("job_prompt", None)
+
             st.success("Saved.")
             st.rerun()
 
@@ -425,9 +438,18 @@ elif mode == "Rate" and not is_host:
                 st.caption(f"Ratings so far: {int(stats['n'])}")
 
             with st.form(f"vote_{s['id']}"):
-                loneliness = st.slider("How much loneliness is present in this image?", 1, 5, 3, key=f"lon_{s['id']}")
-                recognizable = st.slider("How recognizable is this as student-life loneliness?", 1, 5, 3, key=f"rec_{s['id']}")
-                relatable = st.slider("How much do you relate to this image?", 1, 5, 3, key=f"rel_{s['id']}")
+                loneliness = st.slider(
+                    "How much loneliness is present in this image?",
+                    1, 5, 3, key=f"lon_{s['id']}"
+                )
+                recognizable = st.slider(
+                    "How recognizable is this as student-life loneliness?",
+                    1, 5, 3, key=f"rec_{s['id']}"
+                )
+                relatable = st.slider(
+                    "How much do you relate to this image?",
+                    1, 5, 3, key=f"rel_{s['id']}"
+                )
 
                 submitted = st.form_submit_button("Submit", disabled=voted)
                 if submitted:
@@ -532,8 +554,12 @@ elif mode == "Download" and is_host:
     buf = StringIO()
     df.to_csv(buf, index=False)
 
-    st.download_button("Download CSV", buf.getvalue(), "loneliness_workshop.csv", "text/csv")
+    st.download_button(
+        "Download CSV",
+        buf.getvalue(),
+        "loneliness_workshop.csv",
+        "text/csv"
+    )
 
 else:
     st.info("Select a mode from the sidebar.")
-
