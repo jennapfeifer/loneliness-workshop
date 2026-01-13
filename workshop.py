@@ -73,8 +73,6 @@ def init_db():
         )
         """)
 
-        # ---- MIGRATION: if an old "votes" table exists with valence/intensity,
-        # rename it so we can create the new schema safely.
         desired_cols = {
             "id", "image_id", "participant_id",
             "loneliness", "recognizable", "relatable",
@@ -87,7 +85,6 @@ def init_db():
                 backup = _find_free_backup_name(conn, "votes_old")
                 conn.execute(f"ALTER TABLE votes RENAME TO {backup};")
 
-        # New schema: loneliness + recognizability + relatability (all 1–5)
         c.execute("""
         CREATE TABLE IF NOT EXISTS votes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +112,9 @@ def image_to_blob(image: Image.Image) -> bytes:
 def blob_to_image(blob: bytes) -> Image.Image:
     return Image.open(BytesIO(blob))
 
+# ============================================================
+# JOB QUEUE + GEMINI WORKER
+# ============================================================
 @dataclass
 class Job:
     future: concurrent.futures.Future
@@ -122,24 +122,20 @@ class Job:
 
 @st.cache_resource
 def shared_runtime():
-    # One shared pool for the whole Streamlit process (all users)
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)  # tune: 2–6
-    sem = threading.BoundedSemaphore(4)  # max concurrent Gemini calls (same as max_workers usually)
+    # Shared across all sessions in this Streamlit process
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)  # tune 2–6
+    sem = threading.BoundedSemaphore(4)  # throttle Gemini concurrency
     lock = threading.Lock()
     jobs: dict[str, Job] = {}
     return executor, sem, lock, jobs
 
-@st.cache_resource
+# IMPORTANT: thread-local must NOT be decorated
 _thread_local = threading.local()
 
 def _get_thread_client(api_key: str):
-    # One client per worker thread
+    # Create one Gemini client per worker thread (safe + fast)
     if not hasattr(_thread_local, "client"):
-        http_options = types.HttpOptions(
-            # httpx.Client args; timeout is in seconds
-            client_args={"timeout": 60.0}
-        )
-        _thread_local.client = genai.Client(api_key=api_key, http_options=http_options)
+        _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
 
 def _generate_image_bytes(prompt: str, api_key: str, sem: threading.Semaphore) -> bytes:
@@ -154,24 +150,20 @@ def _generate_image_bytes(prompt: str, api_key: str, sem: threading.Semaphore) -
                 image_config=types.ImageConfig(aspect_ratio="3:2"),
             ),
         )
-
         img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
         if img_part is None:
             raise RuntimeError("No image returned (response had no inline_data).")
-
         return img_part.inline_data.data
     finally:
         sem.release()
 
 def _cleanup_old_jobs(max_age_s: int = 600):
-    """Prevent memory leaks if someone closes the tab mid-job."""
     executor, sem, lock, jobs = shared_runtime()
     now = time.time()
     with lock:
         for jid, job in list(jobs.items()):
             if job.future.done() or (now - job.submitted_at) > max_age_s:
                 jobs.pop(jid, None)
-
 
 # ============================================================
 # DB OPERATIONS
@@ -257,10 +249,7 @@ def add_quadrants(df: pd.DataFrame):
     return df, float(lon_med), float(rec_med)
 
 # ============================================================
-# PLOTTING (Altair with bounded axes 1–5)
-# - X: Avg loneliness present
-# - Y: Avg recognizability
-# - Size: Avg relatability (optional)
+# PLOTTING
 # ============================================================
 def bounded_scatter(df: pd.DataFrame, color_col: str, title: str, size_col: str | None = None):
     df = df.copy()
@@ -323,7 +312,6 @@ with st.sidebar:
 # ============================================================
 st.title("Engineering loneliness with GenAI")
 
-# Only show the subtitle when participants are creating prompts/images
 if mode == "Create" and not is_host:
     st.caption("Write a prompt for a photorealistic, documentary-style photograph.")
 
@@ -344,10 +332,13 @@ if mode == "Create" and not is_host:
 
     prompt = st.text_area("Prompt", height=180)
 
-    # shared resources
     executor, sem, lock, jobs = shared_runtime()
+    _cleanup_old_jobs()
 
-    # submit job
+    with lock:
+        pending = sum(1 for j in jobs.values() if not j.future.done())
+    st.caption(f"Generator queue: {pending} pending")
+
     if st.button("Generate image", key="gen_btn"):
         if not prompt.strip():
             st.warning("Please write a prompt.")
@@ -361,11 +352,11 @@ if mode == "Create" and not is_host:
             with lock:
                 jobs[job_id] = Job(future=fut, submitted_at=time.time())
 
-    # --- auto-polling fragment (reruns every 1s while session is active)
+    # Auto-poll the job (reruns every second)
     try:
         fragment = st.fragment
     except AttributeError:
-        fragment = st.experimental_fragment  # older Streamlit
+        fragment = st.experimental_fragment  # older streamlit
 
     @fragment(run_every=1)
     def poll_job():
@@ -383,9 +374,7 @@ if mode == "Create" and not is_host:
 
         fut = job.future
         elapsed = time.time() - st.session_state.get("job_started", time.time())
-
-        # Show debug state so we can see what's happening
-        st.caption(f"Job {job_id[:8]}… | running={fut.running()} | done={fut.done()} | {elapsed:.1f}s elapsed")
+        st.caption(f"Job {job_id[:8]}… running={fut.running()} done={fut.done()} ({elapsed:.1f}s)")
 
         if fut.done():
             exc = fut.exception()
@@ -409,7 +398,6 @@ if mode == "Create" and not is_host:
             del st.session_state["draft"]
             st.success("Saved.")
             st.rerun()
-
 
 # ============================================================
 # RATE
@@ -437,18 +425,9 @@ elif mode == "Rate" and not is_host:
                 st.caption(f"Ratings so far: {int(stats['n'])}")
 
             with st.form(f"vote_{s['id']}"):
-                loneliness = st.slider(
-                    "How much loneliness is present in this image?",
-                    1, 5, 3, key=f"lon_{s['id']}"
-                )
-                recognizable = st.slider(
-                    "How recognizable is this as student-life loneliness?",
-                    1, 5, 3, key=f"rec_{s['id']}"
-                )
-                relatable = st.slider(
-                    "How much do you relate to this image?",
-                    1, 5, 3, key=f"rel_{s['id']}"
-                )
+                loneliness = st.slider("How much loneliness is present in this image?", 1, 5, 3, key=f"lon_{s['id']}")
+                recognizable = st.slider("How recognizable is this as student-life loneliness?", 1, 5, 3, key=f"rec_{s['id']}")
+                relatable = st.slider("How much do you relate to this image?", 1, 5, 3, key=f"rel_{s['id']}")
 
                 submitted = st.form_submit_button("Submit", disabled=voted)
                 if submitted:
@@ -474,12 +453,8 @@ elif mode == "Gallery" and is_host:
             st.image(s["image"], use_container_width=True)
             st.caption(f"Ratings: {int(stats['n'])}")
 
-
 # ============================================================
 # MAP: QUADRANTS
-# - X = avg_loneliness
-# - Y = avg_recognizable
-# - point size = avg_relatable
 # ============================================================
 elif mode == "Map (Quadrants)" and is_host:
     subs = get_submissions()
@@ -509,8 +484,6 @@ elif mode == "Map (Quadrants)" and is_host:
 
 # ============================================================
 # MAP: KMEANS
-# - Cluster on 3D: (avg_loneliness, avg_recognizable, avg_relatable)
-# - Plot 2D: loneliness vs recognizability; size shows relatability
 # ============================================================
 elif mode == "Map (KMeans)" and is_host:
     subs = get_submissions()
@@ -559,12 +532,8 @@ elif mode == "Download" and is_host:
     buf = StringIO()
     df.to_csv(buf, index=False)
 
-    st.download_button(
-        "Download CSV",
-        buf.getvalue(),
-        "loneliness_workshop.csv",
-        "text/csv"
-    )
+    st.download_button("Download CSV", buf.getvalue(), "loneliness_workshop.csv", "text/csv")
 
 else:
     st.info("Select a mode from the sidebar.")
+
