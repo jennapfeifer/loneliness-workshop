@@ -330,7 +330,6 @@ if mode == "Create" and not is_host:
 
     prompt = st.text_area("Prompt", height=180)
 
-    auto_refresh = st.checkbox("Auto-refresh while generating", value=True)
 
     # Start generation
     if st.button("Generate image", key="gen_btn"):
@@ -366,12 +365,9 @@ if mode == "Create" and not is_host:
         else:
             elapsed = time.time() - st.session_state.get("job_started", time.time())
             st.info(f"Generating… ({elapsed:.1f}s)")
-            if auto_refresh:
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                if st.button("Check status"):
-                    st.rerun()
+            time.sleep(0.5)
+            st.rerun()
+
 
     # Show any error
     if st.session_state.get("gen_error"):
