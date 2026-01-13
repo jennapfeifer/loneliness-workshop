@@ -563,3 +563,4 @@ elif mode == "Download" and is_host:
 
 else:
     st.info("Select a mode from the sidebar.")
+
