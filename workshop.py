@@ -131,7 +131,7 @@ def _generate_image_bytes(prompt: str, api_key: str) -> bytes:
     try:
         client = _get_thread_client(api_key)
         response = client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model="gemini-3-pro-image-preview",
             contents=[prompt],
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
