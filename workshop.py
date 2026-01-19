@@ -16,7 +16,7 @@ from google.genai import types
 # CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="Engineering loneliness with GenAI",
+    page_title="Engineering Loneliness with GenAI",
     layout="wide"
 )
 
@@ -26,10 +26,15 @@ HOST_PASSWORD = "admin123"
 MAX_CONCURRENT_GEN = 8  # across all users on this Streamlit instance
 
 TASK_BYLINE = (
-    "Create a few photorealistic, everyday student-life scenes showing a student who might be lonely. "
-    "Try to inject context (e.g., home, study location, otherwise), and try to inject the student's experience "
-    "(socially, emotionally, or otherwise). Try to vary the situations as much as possible."
+    "Create up to 3 photorealistic, everyday student-life scenes showing a young adult who *might* be lonely "
+    "(third-person; no personal disclosure needed). "
+    "Try to vary the situations (e.g., library, lecture hall, commuting, party). "
+    "Add context and subtle cues: where/when, body language, gaze, distance from others, and small details that suggest "
+    "the person’s experience (socially and/or emotionally). "
+    "You can generate and preview images first. Only submit images you’re happy to share; "
+    "otherwise you can discard and try again."
 )
+
 
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
 
@@ -283,7 +288,7 @@ def export_zip_bytes(include_csv: bool = True) -> bytes:
 # ============================================================
 # UI HEADER
 # ============================================================
-st.title("Engineering loneliness with GenAI")
+st.title("Engineering Loneliness with GenAI")
 st.markdown(f"**Task:** {TASK_BYLINE}")
 
 # ============================================================
@@ -480,8 +485,7 @@ if "executor" not in st.session_state:
 st.caption(f"Submitting as: **{team_name}**")
 
 st.markdown(
-    "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment, "
-    "natural light, and a candid, everyday feel."
+    "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment. "
 )
 
 prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic documentary photograph of...")
