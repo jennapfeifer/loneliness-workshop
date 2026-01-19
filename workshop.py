@@ -2,7 +2,6 @@ import time
 import threading
 import concurrent.futures
 import sqlite3
-import random
 import re
 import zipfile
 from io import BytesIO, StringIO
@@ -108,7 +107,7 @@ def safe_filename(s: str, maxlen: int = 60) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^\w\-]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
-    return (s[:maxlen] or "team")
+    return (s[:maxlen] or "item")
 
 # ============================================================
 # GEMINI HELPERS
@@ -204,7 +203,7 @@ def get_gallery_meta():
 
 def update_host_layout(layout_containers):
     """
-    layout_containers: [{'header': 'Interesting', 'items': ['12 | Team A', ...]}, ...]
+    layout_containers: [{'header': 'Interesting', 'items': ['12', ...]}, ...]
     Stores host_cluster and host_rank based on order in each bucket.
     """
     seen = set()
@@ -273,9 +272,9 @@ def export_zip_bytes(include_csv: bool = True) -> bytes:
 
         for r in rows:
             rid = int(r["id"])
-            team = safe_filename(r["team_name"])
             cluster = safe_filename(r["host_cluster"])
-            fname = f"images/{cluster}/{rid:04d}_{team}.png"
+            # IMPORTANT: do NOT include team name in filenames (prevents accidental leakage)
+            fname = f"images/{cluster}/{rid:04d}.png"
             z.writestr(fname, r["image_blob"])
 
     zbuf.seek(0)
@@ -298,6 +297,7 @@ if HOST_FLAG:
         st.error("Missing dependency: streamlit-sortables. Add it to requirements.txt or pip install streamlit-sortables.")
         st.stop()
 
+    # --- Host sidebar controls
     with st.sidebar:
         st.header("Host login")
         pw = st.text_input("Admin password", type="password")
@@ -316,6 +316,13 @@ if HOST_FLAG:
         n_cols = st.slider("Gallery columns", 2, 6, 4)
         compact = st.toggle("Compact captions", value=True)
 
+        # ---- Privacy controls (DEFAULT: hide attribution)
+        st.divider()
+        st.subheader("Privacy")
+        reveal_team = st.toggle("Reveal team names (admin only)", value=False)
+        reveal_prompt = st.toggle("Reveal prompts (admin only)", value=False)
+        show_ids = st.toggle("Show image # on wall", value=True)
+
         st.divider()
         if st.button("Refresh"):
             st.rerun()
@@ -326,9 +333,18 @@ if HOST_FLAG:
 
     # ---- Build containers from DB meta
     meta = get_gallery_meta()
+
+    # Admin-only lookup stays in sidebar (not on the wall)
+    with st.sidebar.expander("Lookup (image # → team)", expanded=False):
+        st.dataframe(
+            [{"id": m["id"], "team_name": m["team_name"]} for m in meta],
+            use_container_width=True
+        )
+
     by_cluster = {b: [] for b in buckets}
     for m in meta:
-        label = f"{m['id']} | {m['team_name']}".strip()
+        # IMPORTANT: labels are ID-only so team names never appear during curation
+        label = f"{m['id']}".strip()
         cluster = m["host_cluster"] if m["host_cluster"] in by_cluster else "Unsorted"
         by_cluster[cluster].append((m["host_rank"], m["id"], label))
 
@@ -360,11 +376,23 @@ if HOST_FLAG:
             for i, s in enumerate(imgs):
                 with cols[i % n_cols]:
                     st.image(s["image"], use_container_width=True)
+
+                    # ---- Captions: privacy-safe by default
                     if compact:
-                        st.caption(f"**{s.get('team_name','')}**")
+                        if show_ids:
+                            cap = f"#{s.get('id','')}"
+                            if reveal_team:
+                                cap += f" • {s.get('team_name','')}"
+                            st.caption(cap)
                     else:
-                        with st.expander(f"{s.get('team_name','')} • #{s.get('id','')} • {s.get('created_at','')}"):
-                            st.write(s.get("prompt", ""))
+                        header = f"Image #{s.get('id','')}" if show_ids else "Image"
+                        with st.expander(header):
+                            if reveal_team:
+                                st.write(f"**Team:** {s.get('team_name','')}")
+                            if reveal_prompt:
+                                st.write(f"**Prompt:** {s.get('prompt','')}")
+                            if not reveal_team and not reveal_prompt:
+                                st.caption("Details hidden (enable reveal toggles in the sidebar).")
 
     # ---- Views
     if view == "Curate (drag & drop)":
@@ -374,17 +402,14 @@ if HOST_FLAG:
 
         if normalize_layout(new_containers) != normalize_layout(containers):
             update_host_layout(new_containers)
-            # Update local view so preview matches immediately
             containers = new_containers
 
         st.divider()
         st.subheader("Preview (images follow your bucket order)")
         render_bucket_images(containers)
-
         st.stop()
 
     if view == "Gallery wall":
-        # Show current curated view
         render_bucket_images(containers)
         st.stop()
 
@@ -407,7 +432,7 @@ if HOST_FLAG:
             mime="application/zip"
         )
 
-        st.info("ZIP structure: images/<bucket>/<id>_<team>.png plus gallery_metadata.csv at the top level.")
+        st.info("ZIP structure: images/<bucket>/<id>.png plus gallery_metadata.csv at the top level.")
         st.stop()
 
 # ============================================================
