@@ -4,6 +4,7 @@ import concurrent.futures
 import sqlite3
 import re
 import zipfile
+import uuid
 from io import BytesIO, StringIO
 
 import streamlit as st
@@ -16,7 +17,7 @@ from google.genai import types
 # CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="Engineering Loneliness with GenAI",
+    page_title="Engineering loneliness with GenAI",
     layout="wide"
 )
 
@@ -25,16 +26,14 @@ HOST_PASSWORD = "admin123"
 
 MAX_CONCURRENT_GEN = 8  # across all users on this Streamlit instance
 
-TASK_BYLINE = (
-    "Create up to 3 photorealistic, everyday student-life scenes showing a young adult who *might* be lonely "
-    "(third-person; no personal disclosure needed). "
-    "Try to vary the situations (e.g., library, lecture hall, commuting, party). "
-    "Add context and subtle cues: where/when, body language, gaze, distance from others, and small details that suggest "
-    "the person’s experience (socially and/or emotionally). "
-    "You can generate and preview images first. Only submit images you’re happy to share; "
-    "otherwise you can discard and try again."
-)
+# Pick your model here
+IMAGE_MODEL = "gemini-2.5-flash-image"
 
+TASK_BYLINE = (
+    "Create a few photorealistic, everyday student-life scenes showing a student who might be lonely. "
+    "Try to inject context (e.g., home, study location, otherwise), and try to inject the student's experience "
+    "(socially, emotionally, or otherwise). Try to vary the situations as much as possible."
+)
 
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
 
@@ -48,7 +47,6 @@ def qp_get(name: str, default: str = "") -> str:
             return str(v[0]) if v else default
         return str(v)
     except Exception:
-        # fallback for older Streamlit
         v = st.experimental_get_query_params().get(name, [default])
         return str(v[0]) if v else default
 
@@ -73,6 +71,7 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
+        # --- Main gallery table (only submitted images)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS gallery (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,9 +89,56 @@ def init_db():
         if "host_rank" not in cols:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_rank INTEGER")
 
+        # --- MIGRATION: add per-image metrics to gallery (for submitted images)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
+        def add_gallery_col(name: str, ddl: str):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE gallery ADD COLUMN {ddl}")
+
+        add_gallery_col("model_name", "model_name TEXT")
+        add_gallery_col("latency_ms", "latency_ms REAL")          # API call duration (excluding semaphore wait)
+        add_gallery_col("queue_wait_ms", "queue_wait_ms REAL")    # time waiting for concurrency slot
+        add_gallery_col("total_time_ms", "total_time_ms REAL")    # queue_wait + api_time
+        add_gallery_col("prompt_tokens", "prompt_tokens INTEGER")
+        add_gallery_col("candidates_tokens", "candidates_tokens INTEGER")
+        add_gallery_col("total_tokens", "total_tokens INTEGER")
+        add_gallery_col("prompt_chars", "prompt_chars INTEGER")
+        add_gallery_col("prompt_words", "prompt_words INTEGER")
+        add_gallery_col("image_bytes", "image_bytes INTEGER")
+
         # normalize defaults (helps existing rows)
         conn.execute("UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''")
         conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
+
+        # --- generation_log table (logs EVERY attempt, including discarded)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS generation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            team_name TEXT,
+            attempt_index INTEGER,
+            prompt TEXT,
+            status TEXT,  -- generated | submitted | discarded | error
+            created_at TEXT DEFAULT (datetime('now')),
+
+            model_name TEXT,
+            latency_ms REAL,
+            queue_wait_ms REAL,
+            total_time_ms REAL,
+            decision_time_ms REAL,
+
+            prompt_tokens INTEGER,
+            candidates_tokens INTEGER,
+            total_tokens INTEGER,
+            prompt_chars INTEGER,
+            prompt_words INTEGER,
+            image_bytes INTEGER,
+
+            error_message TEXT,
+            gallery_id INTEGER
+        )
+        """)
+
         conn.commit()
 
 init_db()
@@ -120,55 +166,199 @@ def safe_filename(s: str, maxlen: int = 60) -> str:
 _thread_local = threading.local()
 
 def _get_thread_client(api_key: str):
-    # One client per worker thread.
     if not hasattr(_thread_local, "client"):
         _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
 
-def _generate_image_bytes(prompt: str, api_key: str) -> bytes:
+def _extract_usage_tokens(response) -> dict:
+    """
+    Best-effort extraction of token usage from the response.
+    Some image responses/models may not populate this. We still log chars/words.
+    """
+    usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
+    if usage is None:
+        return {"prompt_tokens": None, "candidates_tokens": None, "total_tokens": None}
+
+    if isinstance(usage, dict):
+        return {
+            "prompt_tokens": usage.get("prompt_token_count") or usage.get("promptTokens") or usage.get("prompt_tokens"),
+            "candidates_tokens": usage.get("candidates_token_count") or usage.get("candidatesTokens") or usage.get("candidates_tokens"),
+            "total_tokens": usage.get("total_token_count") or usage.get("totalTokens") or usage.get("total_tokens"),
+        }
+
+    return {
+        "prompt_tokens": getattr(usage, "prompt_token_count", None),
+        "candidates_tokens": getattr(usage, "candidates_token_count", None),
+        "total_tokens": getattr(usage, "total_token_count", None),
+    }
+
+def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> dict:
+    """
+    Never raises. Returns dict:
+      { ok: bool, image_bytes: bytes|None, error: str|None, metrics: dict }
+    """
     sem = global_gen_semaphore()
+
+    t0 = time.perf_counter()
     sem.acquire()
+    t1 = time.perf_counter()
+    queue_wait_ms = (t1 - t0) * 1000.0
+
+    client = _get_thread_client(api_key)
+
+    api_start = time.perf_counter()
+    response = None
+    data = None
+    err = None
+
     try:
-        client = _get_thread_client(api_key)
         response = client.models.generate_content(
-            model="gemini-3-pro-image-preview",
+            model=IMAGE_MODEL,
             contents=[prompt],
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
                 image_config=types.ImageConfig(aspect_ratio="3:2")
             )
         )
+
         img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
         if img_part is None:
             raise RuntimeError("No image returned. Try a simpler, more literal prompt.")
         data = img_part.inline_data.data
         if isinstance(data, str):
             raise RuntimeError("Gemini returned image data as str (expected bytes). Check SDK/response parsing.")
-        return data
-    finally:
-        sem.release()
+
+    except Exception as e:
+        err = str(e)
+
+    api_end = time.perf_counter()
+    sem.release()
+
+    usage = _extract_usage_tokens(response) if response is not None else {"prompt_tokens": None, "candidates_tokens": None, "total_tokens": None}
+    prompt_chars = len(prompt or "")
+    prompt_words = len((prompt or "").split())
+
+    metrics = {
+        "model_name": IMAGE_MODEL,
+        "queue_wait_ms": queue_wait_ms,
+        "latency_ms": (api_end - api_start) * 1000.0,
+        "total_time_ms": (api_end - t0) * 1000.0,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "candidates_tokens": usage.get("candidates_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "prompt_chars": prompt_chars,
+        "prompt_words": prompt_words,
+        "image_bytes": len(data) if data else None,
+    }
+
+    return {
+        "ok": (err is None and data is not None),
+        "image_bytes": data,
+        "error": err,
+        "metrics": metrics,
+    }
 
 # ============================================================
-# DB OPERATIONS
+# GENERATION LOG (attempt-level, includes discarded prompts)
 # ============================================================
-def save_submission(team: str, prompt: str, img: Image.Image):
+def insert_generation_log(session_id: str, team: str, attempt_index: int, prompt: str, status: str,
+                         metrics: dict | None = None, error_message: str | None = None) -> int:
+    metrics = metrics or {}
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO generation_log (
+                session_id, team_name, attempt_index, prompt, status,
+                model_name, latency_ms, queue_wait_ms, total_time_ms, decision_time_ms,
+                prompt_tokens, candidates_tokens, total_tokens,
+                prompt_chars, prompt_words, image_bytes,
+                error_message, gallery_id
+            )
+            VALUES (?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, NULL,
+                    ?, ?, ?,
+                    ?, ?, ?,
+                    ?, NULL)
+            """,
+            (
+                session_id, team, attempt_index, prompt, status,
+                metrics.get("model_name"),
+                metrics.get("latency_ms"),
+                metrics.get("queue_wait_ms"),
+                metrics.get("total_time_ms"),
+                metrics.get("prompt_tokens"),
+                metrics.get("candidates_tokens"),
+                metrics.get("total_tokens"),
+                metrics.get("prompt_chars"),
+                metrics.get("prompt_words"),
+                metrics.get("image_bytes"),
+                error_message
+            )
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+def finalize_generation_log(log_id: int, status: str,
+                            decision_time_ms: float | None = None,
+                            gallery_id: int | None = None):
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO gallery (team_name, prompt, image_blob, host_cluster, host_rank)
-            VALUES (?, ?, ?, 'Unsorted', NULL)
+            UPDATE generation_log
+            SET status = ?,
+                decision_time_ms = COALESCE(?, decision_time_ms),
+                gallery_id = COALESCE(?, gallery_id)
+            WHERE id = ?
             """,
-            (team, prompt, image_to_blob(img))
+            (status, decision_time_ms, gallery_id, log_id)
         )
-        # give it a stable default rank = id
-        conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
         conn.commit()
 
+# ============================================================
+# DB OPERATIONS (gallery = submitted only)
+# ============================================================
+def save_submission(team: str, prompt: str, img: Image.Image, metrics: dict | None = None) -> int:
+    metrics = metrics or {}
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO gallery (
+                team_name, prompt, image_blob,
+                host_cluster, host_rank,
+                model_name, latency_ms, queue_wait_ms, total_time_ms,
+                prompt_tokens, candidates_tokens, total_tokens,
+                prompt_chars, prompt_words, image_bytes
+            )
+            VALUES (
+                ?, ?, ?,
+                'Unsorted', NULL,
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?
+            )
+            """,
+            (
+                team,
+                prompt,
+                image_to_blob(img),
+                metrics.get("model_name"),
+                metrics.get("latency_ms"),
+                metrics.get("queue_wait_ms"),
+                metrics.get("total_time_ms"),
+                metrics.get("prompt_tokens"),
+                metrics.get("candidates_tokens"),
+                metrics.get("total_tokens"),
+                metrics.get("prompt_chars"),
+                metrics.get("prompt_words"),
+                metrics.get("image_bytes"),
+            )
+        )
+        # stable default rank = id
+        conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
+        conn.commit()
+        return int(cur.lastrowid)
+
 def get_submissions_full(order_by: str = "newest"):
-    """
-    Returns list of dicts including decoded PIL images.
-    order_by: 'newest' or 'curated'
-    """
     with get_conn() as conn:
         if order_by == "curated":
             rows = conn.execute("""
@@ -189,9 +379,6 @@ def get_submissions_full(order_by: str = "newest"):
     return out
 
 def get_gallery_meta():
-    """
-    Lightweight: no blobs.
-    """
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT
@@ -200,17 +387,33 @@ def get_gallery_meta():
                 COALESCE(prompt, '') AS prompt,
                 COALESCE(created_at, '') AS created_at,
                 COALESCE(host_cluster, 'Unsorted') AS host_cluster,
-                COALESCE(host_rank, id) AS host_rank
+                COALESCE(host_rank, id) AS host_rank,
+
+                COALESCE(model_name, '') AS model_name,
+                latency_ms,
+                queue_wait_ms,
+                total_time_ms,
+                prompt_tokens,
+                candidates_tokens,
+                total_tokens,
+                prompt_chars,
+                prompt_words,
+                image_bytes
             FROM gallery
             ORDER BY host_cluster, COALESCE(host_rank, id), id
         """).fetchall()
     return [dict(r) for r in rows]
 
+def get_generation_log_rows():
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT *
+            FROM generation_log
+            ORDER BY id ASC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
 def update_host_layout(layout_containers):
-    """
-    layout_containers: [{'header': 'Interesting', 'items': ['12', ...]}, ...]
-    Stores host_cluster and host_rank based on order in each bucket.
-    """
     seen = set()
     updates = []
 
@@ -218,9 +421,13 @@ def update_host_layout(layout_containers):
         cluster = c["header"]
         for rank, label in enumerate(c["items"]):
             try:
-                image_id = int(str(label).split("|", 1)[0].strip())
+                image_id = int(str(label).split("|", 1)[0].o().strip())
             except Exception:
-                continue
+                # NOTE: label is usually just "12" but we keep robust split parsing
+                try:
+                    image_id = int(str(label).strip())
+                except Exception:
+                    continue
             if image_id in seen:
                 continue
             seen.add(image_id)
@@ -244,22 +451,40 @@ def normalize_layout(layout_containers):
             try:
                 ids.append(int(str(label).split("|", 1)[0].strip()))
             except Exception:
-                pass
+                try:
+                    ids.append(int(str(label).strip()))
+                except Exception:
+                    pass
         out.append((c["header"], tuple(ids)))
     return tuple(out)
 
 # ============================================================
 # DOWNLOAD HELPERS
 # ============================================================
-def export_csv_bytes() -> bytes:
+def export_gallery_csv_bytes() -> bytes:
     meta = get_gallery_meta()
     import pandas as pd
-    df = pd.DataFrame(meta, columns=["id", "team_name", "prompt", "created_at", "host_cluster", "host_rank"])
+
+    cols = [
+        "id", "team_name", "prompt", "created_at", "host_cluster", "host_rank",
+        "model_name", "latency_ms", "queue_wait_ms", "total_time_ms",
+        "prompt_tokens", "candidates_tokens", "total_tokens",
+        "prompt_chars", "prompt_words", "image_bytes",
+    ]
+    df = pd.DataFrame(meta, columns=cols)
     buf = StringIO()
     df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
-def export_zip_bytes(include_csv: bool = True) -> bytes:
+def export_generation_log_csv_bytes() -> bytes:
+    rows = get_generation_log_rows()
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    buf = StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+def export_zip_bytes(include_csv: bool = True, include_log: bool = True) -> bytes:
     # Pull raw blobs (faster than re-encoding PIL)
     with get_conn() as conn:
         rows = conn.execute("""
@@ -268,17 +493,20 @@ def export_zip_bytes(include_csv: bool = True) -> bytes:
             ORDER BY host_cluster, host_rank, id
         """).fetchall()
 
-    csv_bytes = export_csv_bytes() if include_csv else None
+    gallery_csv = export_gallery_csv_bytes() if include_csv else None
+    genlog_csv = export_generation_log_csv_bytes() if include_log else None
 
     zbuf = BytesIO()
     with zipfile.ZipFile(zbuf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        if include_csv and csv_bytes:
-            z.writestr("gallery_metadata.csv", csv_bytes)
+        if include_csv and gallery_csv:
+            z.writestr("gallery_metadata.csv", gallery_csv)
+        if include_log and genlog_csv:
+            z.writestr("generation_log.csv", genlog_csv)
 
         for r in rows:
             rid = int(r["id"])
             cluster = safe_filename(r["host_cluster"])
-            # IMPORTANT: do NOT include team name in filenames (prevents accidental leakage)
+            # Privacy-safe filenames: no team names
             fname = f"images/{cluster}/{rid:04d}.png"
             z.writestr(fname, r["image_blob"])
 
@@ -288,21 +516,19 @@ def export_zip_bytes(include_csv: bool = True) -> bytes:
 # ============================================================
 # UI HEADER
 # ============================================================
-st.title("Engineering Loneliness with GenAI")
+st.title("Engineering loneliness with GenAI")
 st.markdown(f"**Task:** {TASK_BYLINE}")
 
 # ============================================================
 # HOST MODE (hidden unless ?host=1)
 # ============================================================
 if HOST_FLAG:
-    # component import only needed for host curation view
     try:
         from streamlit_sortables import sort_items
     except Exception:
         st.error("Missing dependency: streamlit-sortables. Add it to requirements.txt or pip install streamlit-sortables.")
         st.stop()
 
-    # --- Host sidebar controls
     with st.sidebar:
         st.header("Host login")
         pw = st.text_input("Admin password", type="password")
@@ -321,12 +547,12 @@ if HOST_FLAG:
         n_cols = st.slider("Gallery columns", 2, 6, 4)
         compact = st.toggle("Compact captions", value=True)
 
-        # ---- Privacy controls (DEFAULT: hide attribution)
+        # Privacy toggles (default = hide attribution)
         st.divider()
         st.subheader("Privacy")
         reveal_team = st.toggle("Reveal team names (admin only)", value=False)
         reveal_prompt = st.toggle("Reveal prompts (admin only)", value=False)
-        show_ids = st.toggle("Show image # on wall", value=True)
+        show_ids = st.toggle("Show image #", value=True)
 
         st.divider()
         if st.button("Refresh"):
@@ -336,7 +562,6 @@ if HOST_FLAG:
         st.warning("Host mode is enabled via the URL. Enter the admin password in the sidebar.")
         st.stop()
 
-    # ---- Build containers from DB meta
     meta = get_gallery_meta()
 
     # Admin-only lookup stays in sidebar (not on the wall)
@@ -346,9 +571,10 @@ if HOST_FLAG:
             use_container_width=True
         )
 
+    # Build containers from DB meta
     by_cluster = {b: [] for b in buckets}
     for m in meta:
-        # IMPORTANT: labels are ID-only so team names never appear during curation
+        # IMPORTANT: ID-only label so team name never appears during drag/drop
         label = f"{m['id']}".strip()
         cluster = m["host_cluster"] if m["host_cluster"] in by_cluster else "Unsorted"
         by_cluster[cluster].append((m["host_rank"], m["id"], label))
@@ -370,7 +596,10 @@ if HOST_FLAG:
                 try:
                     ids.append(int(str(label).split("|", 1)[0].strip()))
                 except Exception:
-                    pass
+                    try:
+                        ids.append(int(str(label).strip()))
+                    except Exception:
+                        pass
 
             imgs = [subs_by_id[i] for i in ids if i in subs_by_id]
             if not imgs:
@@ -382,7 +611,6 @@ if HOST_FLAG:
                 with cols[i % n_cols]:
                     st.image(s["image"], use_container_width=True)
 
-                    # ---- Captions: privacy-safe by default
                     if compact:
                         if show_ids:
                             cap = f"#{s.get('id','')}"
@@ -399,12 +627,10 @@ if HOST_FLAG:
                             if not reveal_team and not reveal_prompt:
                                 st.caption("Details hidden (enable reveal toggles in the sidebar).")
 
-    # ---- Views
+    # Views
     if view == "Curate (drag & drop)":
         st.subheader("Drag & drop to cluster and reorder")
-
         new_containers = sort_items(containers, multi_containers=True)
-
         if normalize_layout(new_containers) != normalize_layout(containers):
             update_host_layout(new_containers)
             containers = new_containers
@@ -421,23 +647,31 @@ if HOST_FLAG:
     if view == "Download":
         st.subheader("Download gallery data")
 
-        csv_bytes = export_csv_bytes()
+        gallery_csv = export_gallery_csv_bytes()
         st.download_button(
-            "Download CSV (prompts + metadata)",
-            data=csv_bytes,
+            "Download gallery_metadata.csv (submitted images + metrics)",
+            data=gallery_csv,
             file_name="gallery_metadata.csv",
             mime="text/csv"
         )
 
-        zip_bytes = export_zip_bytes(include_csv=True)
+        genlog_csv = export_generation_log_csv_bytes()
         st.download_button(
-            "Download ZIP (all images + CSV)",
+            "Download generation_log.csv (all attempts incl. discarded)",
+            data=genlog_csv,
+            file_name="generation_log.csv",
+            mime="text/csv"
+        )
+
+        zip_bytes = export_zip_bytes(include_csv=True, include_log=True)
+        st.download_button(
+            "Download ZIP (images + both CSVs)",
             data=zip_bytes,
             file_name="gallery_images_and_metadata.zip",
             mime="application/zip"
         )
 
-        st.info("ZIP structure: images/<bucket>/<id>.png plus gallery_metadata.csv at the top level.")
+        st.info("ZIP includes: gallery_metadata.csv, generation_log.csv, and images/<bucket>/<id>.png")
         st.stop()
 
 # ============================================================
@@ -448,12 +682,25 @@ with st.sidebar:
 
     if "team_name" not in st.session_state:
         st.session_state["team_name"] = ""
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = str(uuid.uuid4())
+    if "attempt_index" not in st.session_state:
+        st.session_state["attempt_index"] = 0
 
     if st.session_state["team_name"]:
         st.success(f"Team: {st.session_state['team_name']}")
         if st.button("Change team name"):
+            # If there's an unsubmitted draft, mark it discarded (best-effort)
+            if st.session_state.get("draft_log_id") is not None:
+                dt_ms = None
+                if st.session_state.get("draft_ready_at") is not None:
+                    dt_ms = (time.time() - st.session_state["draft_ready_at"]) * 1000.0
+                finalize_generation_log(st.session_state["draft_log_id"], status="discarded", decision_time_ms=dt_ms)
             st.session_state["team_name"] = ""
             st.session_state.pop("draft_bytes", None)
+            st.session_state.pop("draft_metrics", None)
+            st.session_state.pop("draft_log_id", None)
+            st.session_state.pop("draft_ready_at", None)
             st.session_state.pop("gen_future", None)
             st.session_state.pop("gen_error", None)
             st.rerun()
@@ -470,6 +717,7 @@ if not st.session_state["team_name"]:
     st.stop()
 
 team_name = st.session_state["team_name"]
+session_id = st.session_state["session_id"]
 
 # Secrets check
 if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
@@ -485,7 +733,8 @@ if "executor" not in st.session_state:
 st.caption(f"Submitting as: **{team_name}**")
 
 st.markdown(
-    "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment. "
+    "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment, "
+    "natural light, and a candid, everyday feel."
 )
 
 prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic documentary photograph of...")
@@ -495,17 +744,27 @@ if st.button("Generate image", key="gen_btn"):
     if not prompt.strip():
         st.warning("Please write a prompt.")
     else:
+        # If there is an existing unsubmitted draft, treat it as discarded when generating a new one
+        if st.session_state.get("draft_log_id") is not None:
+            dt_ms = None
+            if st.session_state.get("draft_ready_at") is not None:
+                dt_ms = (time.time() - st.session_state["draft_ready_at"]) * 1000.0
+            finalize_generation_log(st.session_state["draft_log_id"], status="discarded", decision_time_ms=dt_ms)
+            st.session_state.pop("draft_bytes", None)
+            st.session_state.pop("draft_metrics", None)
+            st.session_state.pop("draft_log_id", None)
+            st.session_state.pop("draft_ready_at", None)
+
         fut = st.session_state.get("gen_future")
         if fut is not None and not fut.done():
             st.warning("Already generating…")
         else:
             st.session_state["job_started"] = time.time()
             st.session_state["job_prompt"] = prompt
-            st.session_state.pop("draft_bytes", None)
             st.session_state.pop("gen_error", None)
 
             st.session_state["gen_future"] = st.session_state["executor"].submit(
-                _generate_image_bytes, prompt, api_key
+                _generate_image_bytes_with_metrics, prompt, api_key
             )
 
 # Poll generation
@@ -513,8 +772,45 @@ fut = st.session_state.get("gen_future")
 if fut is not None:
     if fut.done():
         try:
-            data = fut.result()
-            st.session_state["draft_bytes"] = data
+            result = fut.result()
+            used_prompt = st.session_state.get("job_prompt", prompt) or prompt
+            metrics = result.get("metrics", {}) or {}
+
+            # Increment attempt counter
+            st.session_state["attempt_index"] += 1
+            attempt_index = st.session_state["attempt_index"]
+
+            if result.get("ok"):
+                # Store draft in session (not shown: metrics)
+                st.session_state["draft_bytes"] = result["image_bytes"]
+                st.session_state["draft_metrics"] = metrics
+                st.session_state["draft_ready_at"] = time.time()
+
+                # Log generation attempt as "generated"
+                log_id = insert_generation_log(
+                    session_id=session_id,
+                    team=team_name,
+                    attempt_index=attempt_index,
+                    prompt=used_prompt,
+                    status="generated",
+                    metrics=metrics,
+                    error_message=None
+                )
+                st.session_state["draft_log_id"] = log_id
+            else:
+                # Log generation attempt as "error"
+                err = result.get("error") or "Unknown error"
+                insert_generation_log(
+                    session_id=session_id,
+                    team=team_name,
+                    attempt_index=attempt_index,
+                    prompt=used_prompt,
+                    status="error",
+                    metrics=metrics,
+                    error_message=err
+                )
+                st.session_state["gen_error"] = err
+
         except Exception as e:
             st.session_state["gen_error"] = str(e)
         finally:
@@ -529,16 +825,53 @@ if fut is not None:
 if st.session_state.get("gen_error"):
     st.error(f"Generation failed: {st.session_state['gen_error']}")
 
-# Preview + submit
+# Preview + submit/discard
 if "draft_bytes" in st.session_state:
     img = Image.open(BytesIO(st.session_state["draft_bytes"]))
     st.image(img, use_container_width=True)
 
-    if st.button("Submit to gallery", key="submit_btn"):
-        used_prompt = st.session_state.get("job_prompt", prompt) or prompt
-        save_submission(team_name or "Anonymous", used_prompt, img)
-        st.session_state.pop("draft_bytes", None)
-        st.success("Saved to gallery.")
-        st.rerun()
+    # Do NOT show metrics on the page
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        if st.button("Submit to gallery", key="submit_btn"):
+            used_prompt = st.session_state.get("job_prompt", prompt) or prompt
+            metrics = st.session_state.get("draft_metrics", {}) or {}
+
+            gallery_id = save_submission(team_name or "Anonymous", used_prompt, img, metrics=metrics)
+
+            # Mark the generation attempt as submitted + store decision time
+            if st.session_state.get("draft_log_id") is not None:
+                dt_ms = None
+                if st.session_state.get("draft_ready_at") is not None:
+                    dt_ms = (time.time() - st.session_state["draft_ready_at"]) * 1000.0
+                finalize_generation_log(st.session_state["draft_log_id"], status="submitted", decision_time_ms=dt_ms, gallery_id=gallery_id)
+
+            st.session_state.pop("draft_bytes", None)
+            st.session_state.pop("draft_metrics", None)
+            st.session_state.pop("draft_log_id", None)
+            st.session_state.pop("draft_ready_at", None)
+
+            st.success("Saved to gallery.")
+            st.rerun()
+
+    with col_b:
+        if st.button("Discard (don’t submit)", key="discard_btn"):
+            # Mark as discarded + store decision time
+            if st.session_state.get("draft_log_id") is not None:
+                dt_ms = None
+                if st.session_state.get("draft_ready_at") is not None:
+                    dt_ms = (time.time() - st.session_state["draft_ready_at"]) * 1000.0
+                finalize_generation_log(st.session_state["draft_log_id"], status="discarded", decision_time_ms=dt_ms)
+
+            st.session_state.pop("draft_bytes", None)
+            st.session_state.pop("draft_metrics", None)
+            st.session_state.pop("draft_log_id", None)
+            st.session_state.pop("draft_ready_at", None)
+
+            st.info("Discarded. You can generate again.")
+            st.rerun()
+
 
 
