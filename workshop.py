@@ -27,7 +27,7 @@ HOST_PASSWORD = "admin123"
 MAX_CONCURRENT_GEN = 8  # across all users on this Streamlit instance
 
 # Pick your model here
-IMAGE_MODEL = "gemini-2.5-flash-image"
+IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 TASK_BYLINE = (
     "Create a few photorealistic, everyday student-life scenes showing a student who might be lonely. "
