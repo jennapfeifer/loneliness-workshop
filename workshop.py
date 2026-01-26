@@ -689,21 +689,6 @@ with st.sidebar:
 
     if st.session_state["team_name"]:
         st.success(f"Team: {st.session_state['team_name']}")
-        if st.button("Change team name"):
-            # If there's an unsubmitted draft, mark it discarded (best-effort)
-            if st.session_state.get("draft_log_id") is not None:
-                dt_ms = None
-                if st.session_state.get("draft_ready_at") is not None:
-                    dt_ms = (time.time() - st.session_state["draft_ready_at"]) * 1000.0
-                finalize_generation_log(st.session_state["draft_log_id"], status="discarded", decision_time_ms=dt_ms)
-            st.session_state["team_name"] = ""
-            st.session_state.pop("draft_bytes", None)
-            st.session_state.pop("draft_metrics", None)
-            st.session_state.pop("draft_log_id", None)
-            st.session_state.pop("draft_ready_at", None)
-            st.session_state.pop("gen_future", None)
-            st.session_state.pop("gen_error", None)
-            st.rerun()
 
 # Gate: enter team name first
 if not st.session_state["team_name"]:
