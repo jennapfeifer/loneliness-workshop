@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import time
 import threading
-import concurrent.futures
+import concurrent.futures  # kept because you asked to include it
 import sqlite3
 import re
 import zipfile
 import uuid
 from io import BytesIO, StringIO
+from typing import Optional, Dict, Any, List, Tuple
 
 import streamlit as st
 from PIL import Image
@@ -18,24 +21,40 @@ from google.genai import types
 # ============================================================
 st.set_page_config(
     page_title="Engineering loneliness with GenAI",
-    layout="wide"
+    layout="wide",
 )
 
 DB_PATH = "workshop.db"
 HOST_PASSWORD = "admin123"
 
 MAX_CONCURRENT_GEN = 8  # across all users on this Streamlit instance
-
-# Pick your model here
 IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 TASK_BYLINE = (
     "Create a few photorealistic, everyday student-life scenes showing a student who might be lonely. "
-    "Try to inject context (e.g., home, study location, otherwise), and try to inject the student's experience "
+    "Try to specify the context (e.g., home, study location, otherwise), and the student's experience "
     "(socially, emotionally, or otherwise). Try to vary the situations as much as possible."
+    "After the image has been generated, please either sbumit or discard it."
+    "Submit up to two images per group."
 )
 
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
+
+CONSENT_TEXT = """**Before you start**
+
+In this activity, you will enter prompts that are sent to an AI provider to generate images.  
+The AI provider will not use your prompts for model training.
+
+This is a voluntary workshop activity; you can stop at any time without negative consequences.
+
+Your prompts will be collected anonymously. Please do not include real names, emails, faces, or identifiable locations in your prompts.
+
+The workshop includes a research component conducted by Jenna Pfeifer, PhD candidate, Dr.ir. Yke Bauke Eisma, Dr. D. Dodou, and Prof.dr.ir. Joost de Winter.  
+The aim of the research is to investigate how young people conceptualise and recognise loneliness.  
+For questions, contact: j.pfeifer@tudelft.nl.
+
+**May the research team store and use your prompts, corresponding AI-generated images, and ratings for future research and publications?**
+"""
 
 # ============================================================
 # QUERY PARAMS (host mode via ?host=1)
@@ -50,55 +69,73 @@ def qp_get(name: str, default: str = "") -> str:
         v = st.experimental_get_query_params().get(name, [default])
         return str(v[0]) if v else default
 
+
 HOST_FLAG = qp_get("host", "0").strip().lower() in ("1", "true", "yes")
 
 # ============================================================
 # CONCURRENCY
 # ============================================================
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def global_gen_semaphore():
     return threading.BoundedSemaphore(MAX_CONCURRENT_GEN)
+
 
 # ============================================================
 # DATABASE
 # ============================================================
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+def get_conn() -> sqlite3.Connection:
+    # Keep timeout modest so the app doesn't feel "hung" if there's contention.
+    conn = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")  # ms
     return conn
 
-def init_db():
+
+@st.cache_resource(show_spinner=False)
+def init_db_once() -> bool:
+    """
+    Initialize/migrate DB once per server process (NOT on every rerun).
+    This is a common culprit when apps start getting slow as the DB grows.
+    """
     with get_conn() as conn:
         # --- Main gallery table (only submitted images)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS gallery (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team_name TEXT,
-            prompt TEXT,
-            image_blob BLOB,
-            created_at TEXT DEFAULT (datetime('now'))
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gallery (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_name TEXT,
+                prompt TEXT,
+                image_blob BLOB,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """
         )
-        """)
 
         # --- MIGRATION: add host curation fields if missing
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
+        added_host_cluster = False
+        added_host_rank = False
+
         if "host_cluster" not in cols:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_cluster TEXT DEFAULT 'Unsorted'")
+            added_host_cluster = True
         if "host_rank" not in cols:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_rank INTEGER")
+            added_host_rank = True
 
         # --- MIGRATION: add per-image metrics to gallery (for submitted images)
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
+
         def add_gallery_col(name: str, ddl: str):
             if name not in cols:
                 conn.execute(f"ALTER TABLE gallery ADD COLUMN {ddl}")
 
         add_gallery_col("model_name", "model_name TEXT")
-        add_gallery_col("latency_ms", "latency_ms REAL")          # API call duration (excluding semaphore wait)
-        add_gallery_col("queue_wait_ms", "queue_wait_ms REAL")    # time waiting for concurrency slot
-        add_gallery_col("total_time_ms", "total_time_ms REAL")    # queue_wait + api_time
+        add_gallery_col("latency_ms", "latency_ms REAL")
+        add_gallery_col("queue_wait_ms", "queue_wait_ms REAL")
+        add_gallery_col("total_time_ms", "total_time_ms REAL")
         add_gallery_col("prompt_tokens", "prompt_tokens INTEGER")
         add_gallery_col("candidates_tokens", "candidates_tokens INTEGER")
         add_gallery_col("total_tokens", "total_tokens INTEGER")
@@ -106,42 +143,51 @@ def init_db():
         add_gallery_col("prompt_words", "prompt_words INTEGER")
         add_gallery_col("image_bytes", "image_bytes INTEGER")
 
-        # normalize defaults (helps existing rows)
-        conn.execute("UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''")
-        conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
+        # Only run backfills if needed (avoid full-table UPDATE on every rerun)
+        if added_host_cluster:
+            conn.execute(
+                "UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''"
+            )
+        if added_host_rank:
+            conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
 
         # --- generation_log table (logs EVERY attempt, including discarded)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS generation_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            team_name TEXT,
-            attempt_index INTEGER,
-            prompt TEXT,
-            status TEXT,  -- generated | submitted | discarded | error
-            created_at TEXT DEFAULT (datetime('now')),
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                team_name TEXT,
+                attempt_index INTEGER,
+                prompt TEXT,
+                status TEXT,  -- generated | submitted | discarded | error
+                created_at TEXT DEFAULT (datetime('now')),
 
-            model_name TEXT,
-            latency_ms REAL,
-            queue_wait_ms REAL,
-            total_time_ms REAL,
-            decision_time_ms REAL,
+                model_name TEXT,
+                latency_ms REAL,
+                queue_wait_ms REAL,
+                total_time_ms REAL,
+                decision_time_ms REAL,
 
-            prompt_tokens INTEGER,
-            candidates_tokens INTEGER,
-            total_tokens INTEGER,
-            prompt_chars INTEGER,
-            prompt_words INTEGER,
-            image_bytes INTEGER,
+                prompt_tokens INTEGER,
+                candidates_tokens INTEGER,
+                total_tokens INTEGER,
+                prompt_chars INTEGER,
+                prompt_words INTEGER,
+                image_bytes INTEGER,
 
-            error_message TEXT,
-            gallery_id INTEGER
+                error_message TEXT,
+                gallery_id INTEGER
+            )
+            """
         )
-        """)
 
         conn.commit()
 
-init_db()
+    return True
+
+
+init_db_once()
 
 # ============================================================
 # IMAGE HELPERS
@@ -151,8 +197,10 @@ def image_to_blob(image: Image.Image) -> bytes:
     image.save(buf, format="PNG")
     return buf.getvalue()
 
+
 def blob_to_image(blob: bytes) -> Image.Image:
     return Image.open(BytesIO(blob))
+
 
 def safe_filename(s: str, maxlen: int = 60) -> str:
     s = (s or "").strip()
@@ -160,21 +208,21 @@ def safe_filename(s: str, maxlen: int = 60) -> str:
     s = re.sub(r"_+", "_", s).strip("_")
     return (s[:maxlen] or "item")
 
+
 # ============================================================
 # GEMINI HELPERS
 # ============================================================
 _thread_local = threading.local()
 
+
 def _get_thread_client(api_key: str):
+    # Thread-local so multiple Streamlit worker threads don't fight over one client object.
     if not hasattr(_thread_local, "client"):
         _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
 
-def _extract_usage_tokens(response) -> dict:
-    """
-    Best-effort extraction of token usage from the response.
-    Some image responses/models may not populate this. We still log chars/words.
-    """
+
+def _extract_usage_tokens(response) -> Dict[str, Optional[int]]:
     usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
     if usage is None:
         return {"prompt_tokens": None, "candidates_tokens": None, "total_tokens": None}
@@ -182,7 +230,9 @@ def _extract_usage_tokens(response) -> dict:
     if isinstance(usage, dict):
         return {
             "prompt_tokens": usage.get("prompt_token_count") or usage.get("promptTokens") or usage.get("prompt_tokens"),
-            "candidates_tokens": usage.get("candidates_token_count") or usage.get("candidatesTokens") or usage.get("candidates_tokens"),
+            "candidates_tokens": usage.get("candidates_token_count")
+            or usage.get("candidatesTokens")
+            or usage.get("candidates_tokens"),
             "total_tokens": usage.get("total_token_count") or usage.get("totalTokens") or usage.get("total_tokens"),
         }
 
@@ -192,7 +242,8 @@ def _extract_usage_tokens(response) -> dict:
         "total_tokens": getattr(usage, "total_token_count", None),
     }
 
-def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> dict:
+
+def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> Dict[str, Any]:
     """
     Never raises. Returns dict:
       { ok: bool, image_bytes: bytes|None, error: str|None, metrics: dict }
@@ -217,13 +268,14 @@ def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> dict:
             contents=[prompt],
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio="3:2")
-            )
+                image_config=types.ImageConfig(aspect_ratio="3:2"),
+            ),
         )
 
-        img_part = next((p for p in response.parts if getattr(p, "inline_data", None)), None)
+        img_part = next((p for p in getattr(response, "parts", []) if getattr(p, "inline_data", None)), None)
         if img_part is None:
             raise RuntimeError("No image returned. Try a simpler, more literal prompt.")
+
         data = img_part.inline_data.data
         if isinstance(data, str):
             raise RuntimeError("Gemini returned image data as str (expected bytes). Check SDK/response parsing.")
@@ -258,11 +310,19 @@ def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> dict:
         "metrics": metrics,
     }
 
+
 # ============================================================
-# GENERATION LOG (attempt-level, includes discarded prompts)
+# GENERATION LOG
 # ============================================================
-def insert_generation_log(session_id: str, team: str, attempt_index: int, prompt: str, status: str,
-                         metrics: dict | None = None, error_message: str | None = None) -> int:
+def insert_generation_log(
+    session_id: str,
+    team: str,
+    attempt_index: int,
+    prompt: str,
+    status: str,
+    metrics: Optional[Dict[str, Any]] = None,
+    error_message: Optional[str] = None,
+) -> int:
     metrics = metrics or {}
     with get_conn() as conn:
         cur = conn.execute(
@@ -281,7 +341,11 @@ def insert_generation_log(session_id: str, team: str, attempt_index: int, prompt
                     ?, NULL)
             """,
             (
-                session_id, team, attempt_index, prompt, status,
+                session_id,
+                team,
+                attempt_index,
+                prompt,
+                status,
                 metrics.get("model_name"),
                 metrics.get("latency_ms"),
                 metrics.get("queue_wait_ms"),
@@ -292,15 +356,19 @@ def insert_generation_log(session_id: str, team: str, attempt_index: int, prompt
                 metrics.get("prompt_chars"),
                 metrics.get("prompt_words"),
                 metrics.get("image_bytes"),
-                error_message
-            )
+                error_message,
+            ),
         )
         conn.commit()
         return int(cur.lastrowid)
 
-def finalize_generation_log(log_id: int, status: str,
-                            decision_time_ms: float | None = None,
-                            gallery_id: int | None = None):
+
+def finalize_generation_log(
+    log_id: int,
+    status: str,
+    decision_time_ms: Optional[float] = None,
+    gallery_id: Optional[int] = None,
+):
     with get_conn() as conn:
         conn.execute(
             """
@@ -310,14 +378,15 @@ def finalize_generation_log(log_id: int, status: str,
                 gallery_id = COALESCE(?, gallery_id)
             WHERE id = ?
             """,
-            (status, decision_time_ms, gallery_id, log_id)
+            (status, decision_time_ms, gallery_id, log_id),
         )
         conn.commit()
+
 
 # ============================================================
 # DB OPERATIONS (gallery = submitted only)
 # ============================================================
-def save_submission(team: str, prompt: str, img: Image.Image, metrics: dict | None = None) -> int:
+def save_submission(team: str, prompt: str, img: Image.Image, metrics: Optional[Dict[str, Any]] = None) -> int:
     metrics = metrics or {}
     with get_conn() as conn:
         cur = conn.execute(
@@ -351,83 +420,92 @@ def save_submission(team: str, prompt: str, img: Image.Image, metrics: dict | No
                 metrics.get("prompt_chars"),
                 metrics.get("prompt_words"),
                 metrics.get("image_bytes"),
-            )
+            ),
         )
-        # stable default rank = id
         conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
         conn.commit()
         return int(cur.lastrowid)
 
-def get_submissions_full(order_by: str = "newest"):
+
+def get_gallery_meta(order_by: str = "curated") -> List[Dict[str, Any]]:
     with get_conn() as conn:
         if order_by == "curated":
-            rows = conn.execute("""
-                SELECT * FROM gallery
-                ORDER BY host_cluster, host_rank, id
-            """).fetchall()
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    COALESCE(team_name, '') AS team_name,
+                    COALESCE(prompt, '') AS prompt,
+                    COALESCE(created_at, '') AS created_at,
+                    COALESCE(host_cluster, 'Unsorted') AS host_cluster,
+                    COALESCE(host_rank, id) AS host_rank,
+
+                    COALESCE(model_name, '') AS model_name,
+                    latency_ms,
+                    queue_wait_ms,
+                    total_time_ms,
+                    prompt_tokens,
+                    candidates_tokens,
+                    total_tokens,
+                    prompt_chars,
+                    prompt_words,
+                    image_bytes
+                FROM gallery
+                ORDER BY host_cluster, COALESCE(host_rank, id), id
+                """
+            ).fetchall()
         else:
-            rows = conn.execute("""
-                SELECT * FROM gallery
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    COALESCE(team_name, '') AS team_name,
+                    COALESCE(prompt, '') AS prompt,
+                    COALESCE(created_at, '') AS created_at,
+                    COALESCE(host_cluster, 'Unsorted') AS host_cluster,
+                    COALESCE(host_rank, id) AS host_rank,
+
+                    COALESCE(model_name, '') AS model_name,
+                    latency_ms,
+                    queue_wait_ms,
+                    total_time_ms,
+                    prompt_tokens,
+                    candidates_tokens,
+                    total_tokens,
+                    prompt_chars,
+                    prompt_words,
+                    image_bytes
+                FROM gallery
                 ORDER BY id DESC
-            """).fetchall()
+                """
+            ).fetchall()
 
-    out = []
-    for r in rows:
-        d = dict(r)
-        d["image"] = blob_to_image(d["image_blob"])
-        out.append(d)
-    return out
-
-def get_gallery_meta():
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT
-                id,
-                COALESCE(team_name, '') AS team_name,
-                COALESCE(prompt, '') AS prompt,
-                COALESCE(created_at, '') AS created_at,
-                COALESCE(host_cluster, 'Unsorted') AS host_cluster,
-                COALESCE(host_rank, id) AS host_rank,
-
-                COALESCE(model_name, '') AS model_name,
-                latency_ms,
-                queue_wait_ms,
-                total_time_ms,
-                prompt_tokens,
-                candidates_tokens,
-                total_tokens,
-                prompt_chars,
-                prompt_words,
-                image_bytes
-            FROM gallery
-            ORDER BY host_cluster, COALESCE(host_rank, id), id
-        """).fetchall()
     return [dict(r) for r in rows]
 
-def get_generation_log_rows():
+
+def get_gallery_blobs() -> Dict[int, bytes]:
     with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT *
-            FROM generation_log
-            ORDER BY id ASC
-        """).fetchall()
+        rows = conn.execute("SELECT id, image_blob FROM gallery").fetchall()
+    return {int(r["id"]): r["image_blob"] for r in rows}
+
+
+def get_generation_log_rows() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM generation_log ORDER BY id ASC").fetchall()
     return [dict(r) for r in rows]
 
-def update_host_layout(layout_containers):
+
+def update_host_layout(layout_containers: List[Dict[str, Any]]):
     seen = set()
-    updates = []
+    updates: List[Tuple[str, int, int]] = []
 
     for c in layout_containers:
         cluster = c["header"]
         for rank, label in enumerate(c["items"]):
             try:
-                image_id = int(str(label).split("|", 1)[0].o().strip())
+                image_id = int(str(label).split("|", 1)[0].strip())
             except Exception:
-                # NOTE: label is usually just "12" but we keep robust split parsing
-                try:
-                    image_id = int(str(label).strip())
-                except Exception:
-                    continue
+                continue
             if image_id in seen:
                 continue
             seen.add(image_id)
@@ -437,13 +515,11 @@ def update_host_layout(layout_containers):
         return
 
     with get_conn() as conn:
-        conn.executemany(
-            "UPDATE gallery SET host_cluster=?, host_rank=? WHERE id=?",
-            updates
-        )
+        conn.executemany("UPDATE gallery SET host_cluster=?, host_rank=? WHERE id=?", updates)
         conn.commit()
 
-def normalize_layout(layout_containers):
+
+def normalize_layout(layout_containers: List[Dict[str, Any]]) -> Tuple[Tuple[str, Tuple[int, ...]], ...]:
     out = []
     for c in layout_containers:
         ids = []
@@ -451,47 +527,61 @@ def normalize_layout(layout_containers):
             try:
                 ids.append(int(str(label).split("|", 1)[0].strip()))
             except Exception:
-                try:
-                    ids.append(int(str(label).strip()))
-                except Exception:
-                    pass
+                pass
         out.append((c["header"], tuple(ids)))
     return tuple(out)
+
 
 # ============================================================
 # DOWNLOAD HELPERS
 # ============================================================
 def export_gallery_csv_bytes() -> bytes:
-    meta = get_gallery_meta()
     import pandas as pd
 
+    meta = get_gallery_meta(order_by="curated")
     cols = [
-        "id", "team_name", "prompt", "created_at", "host_cluster", "host_rank",
-        "model_name", "latency_ms", "queue_wait_ms", "total_time_ms",
-        "prompt_tokens", "candidates_tokens", "total_tokens",
-        "prompt_chars", "prompt_words", "image_bytes",
+        "id",
+        "team_name",
+        "prompt",
+        "created_at",
+        "host_cluster",
+        "host_rank",
+        "model_name",
+        "latency_ms",
+        "queue_wait_ms",
+        "total_time_ms",
+        "prompt_tokens",
+        "candidates_tokens",
+        "total_tokens",
+        "prompt_chars",
+        "prompt_words",
+        "image_bytes",
     ]
     df = pd.DataFrame(meta, columns=cols)
     buf = StringIO()
     df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
+
 def export_generation_log_csv_bytes() -> bytes:
-    rows = get_generation_log_rows()
     import pandas as pd
+
+    rows = get_generation_log_rows()
     df = pd.DataFrame(rows)
     buf = StringIO()
     df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
+
 def export_zip_bytes(include_csv: bool = True, include_log: bool = True) -> bytes:
-    # Pull raw blobs (faster than re-encoding PIL)
     with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT id, team_name, prompt, created_at, host_cluster, host_rank, image_blob
+        rows = conn.execute(
+            """
+            SELECT id, host_cluster, image_blob
             FROM gallery
-            ORDER BY host_cluster, host_rank, id
-        """).fetchall()
+            ORDER BY COALESCE(host_cluster,'Unsorted'), COALESCE(host_rank,id), id
+            """
+        ).fetchall()
 
     gallery_csv = export_gallery_csv_bytes() if include_csv else None
     genlog_csv = export_generation_log_csv_bytes() if include_log else None
@@ -505,13 +595,13 @@ def export_zip_bytes(include_csv: bool = True, include_log: bool = True) -> byte
 
         for r in rows:
             rid = int(r["id"])
-            cluster = safe_filename(r["host_cluster"])
-            # Privacy-safe filenames: no team names
+            cluster = safe_filename(r["host_cluster"] or "Unsorted")
             fname = f"images/{cluster}/{rid:04d}.png"
             z.writestr(fname, r["image_blob"])
 
     zbuf.seek(0)
     return zbuf.getvalue()
+
 
 # ============================================================
 # UI HEADER
@@ -547,7 +637,6 @@ if HOST_FLAG:
         n_cols = st.slider("Gallery columns", 2, 6, 4)
         compact = st.toggle("Compact captions", value=True)
 
-        # Privacy toggles (default = hide attribution)
         st.divider()
         st.subheader("Privacy")
         reveal_team = st.toggle("Reveal team names (admin only)", value=False)
@@ -562,72 +651,66 @@ if HOST_FLAG:
         st.warning("Host mode is enabled via the URL. Enter the admin password in the sidebar.")
         st.stop()
 
-    meta = get_gallery_meta()
+    meta = get_gallery_meta(order_by="curated")
+    blobs_by_id = get_gallery_blobs()
 
-    # Admin-only lookup stays in sidebar (not on the wall)
     with st.sidebar.expander("Lookup (image # → team)", expanded=False):
-        st.dataframe(
-            [{"id": m["id"], "team_name": m["team_name"]} for m in meta],
-            use_container_width=True
-        )
+        st.dataframe([{"id": m["id"], "team_name": m["team_name"]} for m in meta], use_container_width=True)
 
-    # Build containers from DB meta
     by_cluster = {b: [] for b in buckets}
+    meta_by_id = {int(m["id"]): m for m in meta}
+
     for m in meta:
-        # IMPORTANT: ID-only label so team name never appears during drag/drop
-        label = f"{m['id']}".strip()
+        image_id = int(m["id"])
+        label = f"{image_id}"
         cluster = m["host_cluster"] if m["host_cluster"] in by_cluster else "Unsorted"
-        by_cluster[cluster].append((m["host_rank"], m["id"], label))
+        by_cluster[cluster].append((m["host_rank"], image_id, label))
 
     containers = []
     for b in buckets:
         items = [lbl for _, _, lbl in sorted(by_cluster[b], key=lambda x: (x[0], x[1]))]
         containers.append({"header": b, "items": items})
 
-    # For image rendering
-    subs_full = get_submissions_full(order_by="curated")
-    subs_by_id = {s["id"]: s for s in subs_full}
-
     def render_bucket_images(layout_containers):
         for c in layout_containers:
             st.markdown(f"### {c['header']}")
-            ids = []
+            ids: List[int] = []
             for label in c["items"]:
                 try:
                     ids.append(int(str(label).split("|", 1)[0].strip()))
                 except Exception:
-                    try:
-                        ids.append(int(str(label).strip()))
-                    except Exception:
-                        pass
+                    pass
 
-            imgs = [subs_by_id[i] for i in ids if i in subs_by_id]
-            if not imgs:
+            if not ids:
                 st.caption("—")
                 continue
 
             cols = st.columns(n_cols)
-            for i, s in enumerate(imgs):
+            for i, image_id in enumerate(ids):
+                blob = blobs_by_id.get(image_id)
+                if not blob:
+                    continue
+
+                m = meta_by_id.get(image_id, {})
                 with cols[i % n_cols]:
-                    st.image(s["image"], use_container_width=True)
+                    st.image(blob, use_container_width=True)
 
                     if compact:
                         if show_ids:
-                            cap = f"#{s.get('id','')}"
+                            cap = f"#{image_id}"
                             if reveal_team:
-                                cap += f" • {s.get('team_name','')}"
+                                cap += f" • {m.get('team_name','')}"
                             st.caption(cap)
                     else:
-                        header = f"Image #{s.get('id','')}" if show_ids else "Image"
+                        header = f"Image #{image_id}" if show_ids else "Image"
                         with st.expander(header):
                             if reveal_team:
-                                st.write(f"**Team:** {s.get('team_name','')}")
+                                st.write(f"**Team:** {m.get('team_name','')}")
                             if reveal_prompt:
-                                st.write(f"**Prompt:** {s.get('prompt','')}")
+                                st.write(f"**Prompt:** {m.get('prompt','')}")
                             if not reveal_team and not reveal_prompt:
                                 st.caption("Details hidden (enable reveal toggles in the sidebar).")
 
-    # Views
     if view == "Curate (drag & drop)":
         st.subheader("Drag & drop to cluster and reorder")
         new_containers = sort_items(containers, multi_containers=True)
@@ -652,7 +735,7 @@ if HOST_FLAG:
             "Download gallery_metadata.csv (submitted images + metrics)",
             data=gallery_csv,
             file_name="gallery_metadata.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
         genlog_csv = export_generation_log_csv_bytes()
@@ -660,7 +743,7 @@ if HOST_FLAG:
             "Download generation_log.csv (all attempts incl. discarded)",
             data=genlog_csv,
             file_name="generation_log.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
         zip_bytes = export_zip_bytes(include_csv=True, include_log=True)
@@ -668,7 +751,7 @@ if HOST_FLAG:
             "Download ZIP (images + both CSVs)",
             data=zip_bytes,
             file_name="gallery_images_and_metadata.zip",
-            mime="application/zip"
+            mime="application/zip",
         )
 
         st.info("ZIP includes: gallery_metadata.csv, generation_log.csv, and images/<bucket>/<id>.png")
@@ -677,32 +760,114 @@ if HOST_FLAG:
 # ============================================================
 # PARTICIPANT MODE (default)
 # ============================================================
+def reset_participant_state():
+    keys = [
+        "setup_complete",
+        "group_size",
+        "team_name",
+        "session_id",
+        "attempt_index",
+        "draft_bytes",
+        "draft_metrics",
+        "draft_log_id",
+        "draft_ready_at",
+        "last_prompt_used",
+    ]
+    for k in keys:
+        st.session_state.pop(k, None)
+
+    # also clear consent keys
+    for k in list(st.session_state.keys()):
+        if str(k).startswith("consent_choice_"):
+            st.session_state.pop(k, None)
+
+
 with st.sidebar:
-    st.header("Your info")
+    st.header("Setup")
+    if st.button("Restart setup"):
+        reset_participant_state()
+        st.rerun()
 
-    if "team_name" not in st.session_state:
-        st.session_state["team_name"] = ""
-    if "session_id" not in st.session_state:
-        st.session_state["session_id"] = str(uuid.uuid4())
-    if "attempt_index" not in st.session_state:
-        st.session_state["attempt_index"] = 0
+    st.divider()
+    st.caption("Tip: If the app ever feels stuck, restart setup to clear in-progress state.")
 
-    if st.session_state["team_name"]:
-        st.success(f"Team: {st.session_state['team_name']}")
 
-# Gate: enter team name first
-if not st.session_state["team_name"]:
-    team = st.text_input("Enter your team name to begin", placeholder="e.g., Team Blue")
-    if st.button("Continue"):
-        if not team.strip():
-            st.warning("Please enter a team name.")
+# Ensure defaults
+st.session_state.setdefault("setup_complete", False)
+st.session_state.setdefault("group_size", 0)
+st.session_state.setdefault("team_name", "")
+st.session_state.setdefault("session_id", str(uuid.uuid4()))
+st.session_state.setdefault("attempt_index", 0)
+
+# ---------- SETUP FLOW ----------
+if not st.session_state["setup_complete"]:
+    st.subheader("Welcome")
+
+    # Step 1: group size
+    st.session_state["group_size"] = int(
+        st.number_input(
+            "How many people are in your group?",
+            min_value=1,
+            max_value=20,
+            value=max(1, int(st.session_state.get("group_size") or 1)),
+            step=1,
+        )
+    )
+
+    n = st.session_state["group_size"]
+
+    st.markdown("### Consent")
+    st.markdown("Please complete consent for **each person** in your group.")
+
+    all_yes = True
+    for i in range(1, n + 1):
+        st.markdown(f"#### Person {i}")
+        st.markdown(CONSENT_TEXT)
+
+        # default = "No" (safe). User must actively pick Yes for each person.
+        choice = st.radio(
+            f"Consent (Person {i})",
+            options=["No", "Yes"],
+            index=0,
+            horizontal=True,
+            key=f"consent_choice_{i}",
+        )
+        if choice != "Yes":
+            all_yes = False
+
+        st.divider()
+
+    st.markdown("### Group name")
+    group = st.text_input("Enter your group name", placeholder="e.g., Team Blue", value=st.session_state.get("team_name", ""))
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        proceed = st.button("Continue")
+    with col2:
+        if not all_yes:
+            st.warning("Everyone must consent (Yes) to continue.")
+
+    if proceed:
+        if not all_yes:
+            st.error("Cannot continue: at least one person selected No.")
+        elif not group.strip():
+            st.error("Please enter a group name.")
         else:
-            st.session_state["team_name"] = team.strip()
+            st.session_state["team_name"] = group.strip()
+            st.session_state["session_id"] = str(uuid.uuid4())
+            st.session_state["attempt_index"] = 0
+            st.session_state["setup_complete"] = True
             st.rerun()
+
     st.stop()
 
+# ---------- MAIN APP ----------
 team_name = st.session_state["team_name"]
 session_id = st.session_state["session_id"]
+
+with st.sidebar:
+    st.header("Your info")
+    st.success(f"Group: {team_name}")
 
 # Secrets check
 if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
@@ -711,12 +876,7 @@ if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
 
 api_key = st.secrets["google_api"]["key"]
 
-# One executor per session
-if "executor" not in st.session_state:
-    st.session_state["executor"] = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
 st.caption(f"Submitting as: **{team_name}**")
-
 st.markdown(
     "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment, "
     "natural light, and a candid, everyday feel."
@@ -724,7 +884,7 @@ st.markdown(
 
 prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic documentary photograph of...")
 
-# Generate
+# Generate (synchronous; avoids rerun polling loops)
 if st.button("Generate image", key="gen_btn"):
     if not prompt.strip():
         st.warning("Please write a prompt.")
@@ -735,103 +895,73 @@ if st.button("Generate image", key="gen_btn"):
             if st.session_state.get("draft_ready_at") is not None:
                 dt_ms = (time.time() - st.session_state["draft_ready_at"]) * 1000.0
             finalize_generation_log(st.session_state["draft_log_id"], status="discarded", decision_time_ms=dt_ms)
+
             st.session_state.pop("draft_bytes", None)
             st.session_state.pop("draft_metrics", None)
             st.session_state.pop("draft_log_id", None)
             st.session_state.pop("draft_ready_at", None)
 
-        fut = st.session_state.get("gen_future")
-        if fut is not None and not fut.done():
-            st.warning("Already generating…")
-        else:
-            st.session_state["job_started"] = time.time()
-            st.session_state["job_prompt"] = prompt
-            st.session_state.pop("gen_error", None)
+        with st.spinner("Generating…"):
+            result = _generate_image_bytes_with_metrics(prompt.strip(), api_key)
 
-            st.session_state["gen_future"] = st.session_state["executor"].submit(
-                _generate_image_bytes_with_metrics, prompt, api_key
+        st.session_state["attempt_index"] += 1
+        attempt_index = st.session_state["attempt_index"]
+
+        metrics = result.get("metrics", {}) or {}
+
+        if result.get("ok"):
+            st.session_state["draft_bytes"] = result["image_bytes"]
+            st.session_state["draft_metrics"] = metrics
+            st.session_state["draft_ready_at"] = time.time()
+            st.session_state["last_prompt_used"] = prompt.strip()
+
+            log_id = insert_generation_log(
+                session_id=session_id,
+                team=team_name,
+                attempt_index=attempt_index,
+                prompt=prompt.strip(),
+                status="generated",
+                metrics=metrics,
+                error_message=None,
             )
-
-# Poll generation
-fut = st.session_state.get("gen_future")
-if fut is not None:
-    if fut.done():
-        try:
-            result = fut.result()
-            used_prompt = st.session_state.get("job_prompt", prompt) or prompt
-            metrics = result.get("metrics", {}) or {}
-
-            # Increment attempt counter
-            st.session_state["attempt_index"] += 1
-            attempt_index = st.session_state["attempt_index"]
-
-            if result.get("ok"):
-                # Store draft in session (not shown: metrics)
-                st.session_state["draft_bytes"] = result["image_bytes"]
-                st.session_state["draft_metrics"] = metrics
-                st.session_state["draft_ready_at"] = time.time()
-
-                # Log generation attempt as "generated"
-                log_id = insert_generation_log(
-                    session_id=session_id,
-                    team=team_name,
-                    attempt_index=attempt_index,
-                    prompt=used_prompt,
-                    status="generated",
-                    metrics=metrics,
-                    error_message=None
-                )
-                st.session_state["draft_log_id"] = log_id
-            else:
-                # Log generation attempt as "error"
-                err = result.get("error") or "Unknown error"
-                insert_generation_log(
-                    session_id=session_id,
-                    team=team_name,
-                    attempt_index=attempt_index,
-                    prompt=used_prompt,
-                    status="error",
-                    metrics=metrics,
-                    error_message=err
-                )
-                st.session_state["gen_error"] = err
-
-        except Exception as e:
-            st.session_state["gen_error"] = str(e)
-        finally:
-            st.session_state.pop("gen_future", None)
-    else:
-        elapsed = time.time() - st.session_state.get("job_started", time.time())
-        st.info(f"Generating… ({elapsed:.1f}s)")
-        time.sleep(0.4)
-        st.rerun()
-
-# Error
-if st.session_state.get("gen_error"):
-    st.error(f"Generation failed: {st.session_state['gen_error']}")
+            st.session_state["draft_log_id"] = log_id
+        else:
+            err = result.get("error") or "Unknown error"
+            insert_generation_log(
+                session_id=session_id,
+                team=team_name,
+                attempt_index=attempt_index,
+                prompt=prompt.strip(),
+                status="error",
+                metrics=metrics,
+                error_message=err,
+            )
+            st.error(f"Generation failed: {err}")
 
 # Preview + submit/discard
 if "draft_bytes" in st.session_state:
     img = Image.open(BytesIO(st.session_state["draft_bytes"]))
     st.image(img, use_container_width=True)
 
-    # Do NOT show metrics on the page
-
     col_a, col_b = st.columns(2)
 
     with col_a:
         if st.button("Submit to gallery", key="submit_btn"):
-            used_prompt = st.session_state.get("job_prompt", prompt) or prompt
+            used_prompt = st.session_state.get("last_prompt_used", prompt).strip() or prompt.strip()
             metrics = st.session_state.get("draft_metrics", {}) or {}
 
             gallery_id = save_submission(team_name or "Anonymous", used_prompt, img, metrics=metrics)
 
-            # Mark the generation attempt as submitted + store decision time
             if st.session_state.get("draft_log_id") is not None:
                 dt_ms = None
                 if st.session_state.get("draft_ready_at") is not None:
                     dt_ms = (time.time() - st.session_state["draft_ready_at"]) * 1000.0
-                finalize_generation_log(st.session_state["draft_log_id"], status="submitted", decision_time_ms=dt_ms, gallery_id=gallery_id)
+                finalize_generation_log(
+                    st.session_state["draft_log_id"],
+                    status="submitted",
+                    decision_time_ms=dt_ms,
+                    gallery_id=gallery_id,
+                )
 
             st.session_state.pop("draft_bytes", None)
             st.session_state.pop("draft_metrics", None)
@@ -843,7 +973,6 @@ if "draft_bytes" in st.session_state:
 
     with col_b:
         if st.button("Discard (don’t submit)", key="discard_btn"):
-            # Mark as discarded + store decision time
             if st.session_state.get("draft_log_id") is not None:
                 dt_ms = None
                 if st.session_state.get("draft_ready_at") is not None:
