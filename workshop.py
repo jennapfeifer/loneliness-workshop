@@ -959,11 +959,6 @@ if not st.session_state["setup_complete"]:
 
         st.divider()
 
-    if not all_yes:
-        st.info(
-            "You can continue even if someone does not consent. "
-            "This session will be recorded as **not fully consented**, so you can exclude it later."
-        )
 
     st.markdown("### Group name")
     group = st.text_input("Enter your group name", placeholder="e.g., Team Blue", value=st.session_state.get("team_name", ""))
