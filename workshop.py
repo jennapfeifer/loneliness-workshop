@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import time
 import threading
-import concurrent.futures  # kept because you asked to include it
+import concurrent.futures  # kept (even though we generate synchronously now)
 import sqlite3
 import re
 import zipfile
 import uuid
+import json
 from io import BytesIO, StringIO
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -37,7 +38,6 @@ TASK_BYLINE = (
     "After the image has been generated, please either sbumit or discard it."
     "Submit up to two images per group."
 )
-
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
 
 CONSENT_TEXT = """**Before you start**
@@ -79,12 +79,10 @@ HOST_FLAG = qp_get("host", "0").strip().lower() in ("1", "true", "yes")
 def global_gen_semaphore():
     return threading.BoundedSemaphore(MAX_CONCURRENT_GEN)
 
-
 # ============================================================
 # DATABASE
 # ============================================================
 def get_conn() -> sqlite3.Connection:
-    # Keep timeout modest so the app doesn't feel "hung" if there's contention.
     conn = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -97,7 +95,6 @@ def get_conn() -> sqlite3.Connection:
 def init_db_once() -> bool:
     """
     Initialize/migrate DB once per server process (NOT on every rerun).
-    This is a common culprit when apps start getting slow as the DB grows.
     """
     with get_conn() as conn:
         # --- Main gallery table (only submitted images)
@@ -113,11 +110,10 @@ def init_db_once() -> bool:
             """
         )
 
-        # --- MIGRATION: add host curation fields if missing
+        # --- MIGRATION: host curation fields
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
         added_host_cluster = False
         added_host_rank = False
-
         if "host_cluster" not in cols:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_cluster TEXT DEFAULT 'Unsorted'")
             added_host_cluster = True
@@ -125,13 +121,19 @@ def init_db_once() -> bool:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_rank INTEGER")
             added_host_rank = True
 
-        # --- MIGRATION: add per-image metrics to gallery (for submitted images)
+        # --- MIGRATION: add per-image metrics + consent/session fields
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
 
         def add_gallery_col(name: str, ddl: str):
             if name not in cols:
                 conn.execute(f"ALTER TABLE gallery ADD COLUMN {ddl}")
 
+        # session/consent fields
+        add_gallery_col("session_id", "session_id TEXT")
+        add_gallery_col("group_size", "group_size INTEGER")
+        add_gallery_col("consent_all_yes", "consent_all_yes INTEGER")
+
+        # metrics fields
         add_gallery_col("model_name", "model_name TEXT")
         add_gallery_col("latency_ms", "latency_ms REAL")
         add_gallery_col("queue_wait_ms", "queue_wait_ms REAL")
@@ -143,11 +145,9 @@ def init_db_once() -> bool:
         add_gallery_col("prompt_words", "prompt_words INTEGER")
         add_gallery_col("image_bytes", "image_bytes INTEGER")
 
-        # Only run backfills if needed (avoid full-table UPDATE on every rerun)
+        # Backfills only if columns were added (avoid full-table UPDATE every rerun)
         if added_host_cluster:
-            conn.execute(
-                "UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''"
-            )
+            conn.execute("UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''")
         if added_host_rank:
             conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
 
@@ -182,12 +182,65 @@ def init_db_once() -> bool:
             """
         )
 
-        conn.commit()
+        # --- MIGRATION: add consent fields to generation_log
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(generation_log)")]
 
+        def add_log_col(name: str, ddl: str):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE generation_log ADD COLUMN {ddl}")
+
+        add_log_col("group_size", "group_size INTEGER")
+        add_log_col("consent_all_yes", "consent_all_yes INTEGER")
+
+        # --- session_meta table (one row per session to store per-person consent)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_meta (
+                session_id TEXT PRIMARY KEY,
+                team_name TEXT,
+                group_size INTEGER,
+                consent_all_yes INTEGER,
+                consent_choices_json TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+
+        conn.commit()
     return True
 
 
 init_db_once()
+
+
+def upsert_session_meta(
+    session_id: str,
+    team_name: str,
+    group_size: int,
+    consent_all_yes: bool,
+    consent_choices: List[str],
+):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO session_meta (session_id, team_name, group_size, consent_all_yes, consent_choices_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                team_name=excluded.team_name,
+                group_size=excluded.group_size,
+                consent_all_yes=excluded.consent_all_yes,
+                consent_choices_json=excluded.consent_choices_json
+            """,
+            (
+                session_id,
+                team_name,
+                int(group_size),
+                1 if consent_all_yes else 0,
+                json.dumps(consent_choices),
+            ),
+        )
+        conn.commit()
+
 
 # ============================================================
 # IMAGE HELPERS
@@ -196,10 +249,6 @@ def image_to_blob(image: Image.Image) -> bytes:
     buf = BytesIO()
     image.save(buf, format="PNG")
     return buf.getvalue()
-
-
-def blob_to_image(blob: bytes) -> Image.Image:
-    return Image.open(BytesIO(blob))
 
 
 def safe_filename(s: str, maxlen: int = 60) -> str:
@@ -216,7 +265,6 @@ _thread_local = threading.local()
 
 
 def _get_thread_client(api_key: str):
-    # Thread-local so multiple Streamlit worker threads don't fight over one client object.
     if not hasattr(_thread_local, "client"):
         _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
@@ -279,7 +327,6 @@ def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> Dict[str, A
         data = img_part.inline_data.data
         if isinstance(data, str):
             raise RuntimeError("Gemini returned image data as str (expected bytes). Check SDK/response parsing.")
-
     except Exception as e:
         err = str(e)
 
@@ -322,8 +369,17 @@ def insert_generation_log(
     status: str,
     metrics: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
+    group_size: Optional[int] = None,
+    consent_all_yes: Optional[bool] = None,
 ) -> int:
     metrics = metrics or {}
+
+    consent_val = None
+    if consent_all_yes is True:
+        consent_val = 1
+    elif consent_all_yes is False:
+        consent_val = 0
+
     with get_conn() as conn:
         cur = conn.execute(
             """
@@ -332,13 +388,15 @@ def insert_generation_log(
                 model_name, latency_ms, queue_wait_ms, total_time_ms, decision_time_ms,
                 prompt_tokens, candidates_tokens, total_tokens,
                 prompt_chars, prompt_words, image_bytes,
-                error_message, gallery_id
+                error_message, gallery_id,
+                group_size, consent_all_yes
             )
             VALUES (?, ?, ?, ?, ?,
                     ?, ?, ?, ?, NULL,
                     ?, ?, ?,
                     ?, ?, ?,
-                    ?, NULL)
+                    ?, NULL,
+                    ?, ?)
             """,
             (
                 session_id,
@@ -357,6 +415,8 @@ def insert_generation_log(
                 metrics.get("prompt_words"),
                 metrics.get("image_bytes"),
                 error_message,
+                group_size,
+                consent_val,
             ),
         )
         conn.commit()
@@ -386,14 +446,30 @@ def finalize_generation_log(
 # ============================================================
 # DB OPERATIONS (gallery = submitted only)
 # ============================================================
-def save_submission(team: str, prompt: str, img: Image.Image, metrics: Optional[Dict[str, Any]] = None) -> int:
+def save_submission(
+    team: str,
+    prompt: str,
+    img: Image.Image,
+    session_id: str,
+    group_size: Optional[int],
+    consent_all_yes: Optional[bool],
+    metrics: Optional[Dict[str, Any]] = None,
+) -> int:
     metrics = metrics or {}
+
+    consent_val = None
+    if consent_all_yes is True:
+        consent_val = 1
+    elif consent_all_yes is False:
+        consent_val = 0
+
     with get_conn() as conn:
         cur = conn.execute(
             """
             INSERT INTO gallery (
                 team_name, prompt, image_blob,
                 host_cluster, host_rank,
+                session_id, group_size, consent_all_yes,
                 model_name, latency_ms, queue_wait_ms, total_time_ms,
                 prompt_tokens, candidates_tokens, total_tokens,
                 prompt_chars, prompt_words, image_bytes
@@ -401,6 +477,7 @@ def save_submission(team: str, prompt: str, img: Image.Image, metrics: Optional[
             VALUES (
                 ?, ?, ?,
                 'Unsorted', NULL,
+                ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?, ?
@@ -410,6 +487,9 @@ def save_submission(team: str, prompt: str, img: Image.Image, metrics: Optional[
                 team,
                 prompt,
                 image_to_blob(img),
+                session_id,
+                group_size,
+                consent_val,
                 metrics.get("model_name"),
                 metrics.get("latency_ms"),
                 metrics.get("queue_wait_ms"),
@@ -440,6 +520,10 @@ def get_gallery_meta(order_by: str = "curated") -> List[Dict[str, Any]]:
                     COALESCE(host_cluster, 'Unsorted') AS host_cluster,
                     COALESCE(host_rank, id) AS host_rank,
 
+                    COALESCE(session_id, '') AS session_id,
+                    group_size,
+                    consent_all_yes,
+
                     COALESCE(model_name, '') AS model_name,
                     latency_ms,
                     queue_wait_ms,
@@ -464,6 +548,10 @@ def get_gallery_meta(order_by: str = "curated") -> List[Dict[str, Any]]:
                     COALESCE(created_at, '') AS created_at,
                     COALESCE(host_cluster, 'Unsorted') AS host_cluster,
                     COALESCE(host_rank, id) AS host_rank,
+
+                    COALESCE(session_id, '') AS session_id,
+                    group_size,
+                    consent_all_yes,
 
                     COALESCE(model_name, '') AS model_name,
                     latency_ms,
@@ -492,6 +580,12 @@ def get_gallery_blobs() -> Dict[int, bytes]:
 def get_generation_log_rows() -> List[Dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM generation_log ORDER BY id ASC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_session_meta_rows() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM session_meta ORDER BY created_at ASC").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -546,6 +640,9 @@ def export_gallery_csv_bytes() -> bytes:
         "created_at",
         "host_cluster",
         "host_rank",
+        "session_id",
+        "group_size",
+        "consent_all_yes",
         "model_name",
         "latency_ms",
         "queue_wait_ms",
@@ -573,7 +670,17 @@ def export_generation_log_csv_bytes() -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def export_zip_bytes(include_csv: bool = True, include_log: bool = True) -> bytes:
+def export_session_meta_csv_bytes() -> bytes:
+    import pandas as pd
+
+    rows = get_session_meta_rows()
+    df = pd.DataFrame(rows)
+    buf = StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+def export_zip_bytes(include_csv: bool = True, include_log: bool = True, include_session_meta: bool = True) -> bytes:
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -585,6 +692,7 @@ def export_zip_bytes(include_csv: bool = True, include_log: bool = True) -> byte
 
     gallery_csv = export_gallery_csv_bytes() if include_csv else None
     genlog_csv = export_generation_log_csv_bytes() if include_log else None
+    session_meta_csv = export_session_meta_csv_bytes() if include_session_meta else None
 
     zbuf = BytesIO()
     with zipfile.ZipFile(zbuf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -592,6 +700,8 @@ def export_zip_bytes(include_csv: bool = True, include_log: bool = True) -> byte
             z.writestr("gallery_metadata.csv", gallery_csv)
         if include_log and genlog_csv:
             z.writestr("generation_log.csv", genlog_csv)
+        if include_session_meta and session_meta_csv:
+            z.writestr("session_meta.csv", session_meta_csv)
 
         for r in rows:
             rid = int(r["id"])
@@ -653,13 +763,13 @@ if HOST_FLAG:
 
     meta = get_gallery_meta(order_by="curated")
     blobs_by_id = get_gallery_blobs()
-
-    with st.sidebar.expander("Lookup (image # → team)", expanded=False):
-        st.dataframe([{"id": m["id"], "team_name": m["team_name"]} for m in meta], use_container_width=True)
-
-    by_cluster = {b: [] for b in buckets}
     meta_by_id = {int(m["id"]): m for m in meta}
 
+    with st.sidebar.expander("Lookup (image # → team)", expanded=False):
+        st.dataframe([{"id": m["id"], "team_name": m["team_name"], "consent_all_yes": m.get("consent_all_yes")} for m in meta],
+                     use_container_width=True)
+
+    by_cluster = {b: [] for b in buckets}
     for m in meta:
         image_id = int(m["id"])
         label = f"{image_id}"
@@ -708,6 +818,7 @@ if HOST_FLAG:
                                 st.write(f"**Team:** {m.get('team_name','')}")
                             if reveal_prompt:
                                 st.write(f"**Prompt:** {m.get('prompt','')}")
+                            st.write(f"**Consent all yes:** {m.get('consent_all_yes')}")
                             if not reveal_team and not reveal_prompt:
                                 st.caption("Details hidden (enable reveal toggles in the sidebar).")
 
@@ -732,7 +843,7 @@ if HOST_FLAG:
 
         gallery_csv = export_gallery_csv_bytes()
         st.download_button(
-            "Download gallery_metadata.csv (submitted images + metrics)",
+            "Download gallery_metadata.csv (submitted images + metrics + consent flags)",
             data=gallery_csv,
             file_name="gallery_metadata.csv",
             mime="text/csv",
@@ -746,15 +857,23 @@ if HOST_FLAG:
             mime="text/csv",
         )
 
-        zip_bytes = export_zip_bytes(include_csv=True, include_log=True)
+        session_meta_csv = export_session_meta_csv_bytes()
         st.download_button(
-            "Download ZIP (images + both CSVs)",
+            "Download session_meta.csv (per-person consent choices)",
+            data=session_meta_csv,
+            file_name="session_meta.csv",
+            mime="text/csv",
+        )
+
+        zip_bytes = export_zip_bytes(include_csv=True, include_log=True, include_session_meta=True)
+        st.download_button(
+            "Download ZIP (images + CSVs)",
             data=zip_bytes,
             file_name="gallery_images_and_metadata.zip",
             mime="application/zip",
         )
 
-        st.info("ZIP includes: gallery_metadata.csv, generation_log.csv, and images/<bucket>/<id>.png")
+        st.info("ZIP includes: gallery_metadata.csv, generation_log.csv, session_meta.csv, and images/<bucket>/<id>.png")
         st.stop()
 
 # ============================================================
@@ -772,6 +891,8 @@ def reset_participant_state():
         "draft_log_id",
         "draft_ready_at",
         "last_prompt_used",
+        "consent_all_yes",
+        "consent_choices",
     ]
     for k in keys:
         st.session_state.pop(k, None)
@@ -787,24 +908,24 @@ with st.sidebar:
     if st.button("Restart setup"):
         reset_participant_state()
         st.rerun()
-
     st.divider()
     st.caption("Tip: If the app ever feels stuck, restart setup to clear in-progress state.")
 
 
-# Ensure defaults
 st.session_state.setdefault("setup_complete", False)
-st.session_state.setdefault("group_size", 0)
+st.session_state.setdefault("group_size", 1)
 st.session_state.setdefault("team_name", "")
 st.session_state.setdefault("session_id", str(uuid.uuid4()))
 st.session_state.setdefault("attempt_index", 0)
+st.session_state.setdefault("consent_all_yes", None)
+st.session_state.setdefault("consent_choices", None)
 
 # ---------- SETUP FLOW ----------
 if not st.session_state["setup_complete"]:
     st.subheader("Welcome")
 
     # Step 1: group size
-    st.session_state["group_size"] = int(
+    n = int(
         st.number_input(
             "How many people are in your group?",
             min_value=1,
@@ -813,49 +934,63 @@ if not st.session_state["setup_complete"]:
             step=1,
         )
     )
-
-    n = st.session_state["group_size"]
+    st.session_state["group_size"] = n
 
     st.markdown("### Consent")
     st.markdown("Please complete consent for **each person** in your group.")
 
+    consent_choices: List[str] = []
     all_yes = True
+
     for i in range(1, n + 1):
         st.markdown(f"#### Person {i}")
         st.markdown(CONSENT_TEXT)
 
-        # default = "No" (safe). User must actively pick Yes for each person.
         choice = st.radio(
             f"Consent (Person {i})",
             options=["No", "Yes"],
-            index=0,
+            index=0,  # default = No (safe)
             horizontal=True,
             key=f"consent_choice_{i}",
         )
+        consent_choices.append(choice)
         if choice != "Yes":
             all_yes = False
 
         st.divider()
 
+    if not all_yes:
+        st.info(
+            "You can continue even if someone does not consent. "
+            "This session will be recorded as **not fully consented**, so you can exclude it later."
+        )
+
     st.markdown("### Group name")
     group = st.text_input("Enter your group name", placeholder="e.g., Team Blue", value=st.session_state.get("team_name", ""))
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        proceed = st.button("Continue")
-    with col2:
-        if not all_yes:
-            st.warning("Everyone must consent (Yes) to continue.")
+    proceed = st.button("Continue")
 
     if proceed:
-        if not all_yes:
-            st.error("Cannot continue: at least one person selected No.")
-        elif not group.strip():
+        if not group.strip():
             st.error("Please enter a group name.")
         else:
             st.session_state["team_name"] = group.strip()
+            # new session_id for this run (so consent ties cleanly to this session)
             st.session_state["session_id"] = str(uuid.uuid4())
             st.session_state["attempt_index"] = 0
+
+            st.session_state["consent_all_yes"] = all_yes
+            st.session_state["consent_choices"] = consent_choices
+
+            # persist consent immediately
+            upsert_session_meta(
+                session_id=st.session_state["session_id"],
+                team_name=st.session_state["team_name"],
+                group_size=n,
+                consent_all_yes=all_yes,
+                consent_choices=consent_choices,
+            )
+
             st.session_state["setup_complete"] = True
             st.rerun()
 
@@ -864,10 +999,16 @@ if not st.session_state["setup_complete"]:
 # ---------- MAIN APP ----------
 team_name = st.session_state["team_name"]
 session_id = st.session_state["session_id"]
+group_size = st.session_state.get("group_size")
+consent_all_yes = st.session_state.get("consent_all_yes")
 
 with st.sidebar:
     st.header("Your info")
     st.success(f"Group: {team_name}")
+    if consent_all_yes is False:
+        st.warning("Consent: NOT fully consented (you can exclude this session later).")
+    elif consent_all_yes is True:
+        st.success("Consent: fully consented")
 
 # Secrets check
 if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
@@ -878,11 +1019,10 @@ api_key = st.secrets["google_api"]["key"]
 
 st.caption(f"Submitting as: **{team_name}**")
 st.markdown(
-    "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment, "
-    "natural light, and a candid, everyday feel."
+    "**Prompt tip:** Start with *“Photorealistic photograph…”* and specify a real moment, "
 )
 
-prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic documentary photograph of...")
+prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic photograph of...")
 
 # Generate (synchronous; avoids rerun polling loops)
 if st.button("Generate image", key="gen_btn"):
@@ -906,7 +1046,6 @@ if st.button("Generate image", key="gen_btn"):
 
         st.session_state["attempt_index"] += 1
         attempt_index = st.session_state["attempt_index"]
-
         metrics = result.get("metrics", {}) or {}
 
         if result.get("ok"):
@@ -923,6 +1062,8 @@ if st.button("Generate image", key="gen_btn"):
                 status="generated",
                 metrics=metrics,
                 error_message=None,
+                group_size=group_size,
+                consent_all_yes=consent_all_yes,
             )
             st.session_state["draft_log_id"] = log_id
         else:
@@ -935,6 +1076,8 @@ if st.button("Generate image", key="gen_btn"):
                 status="error",
                 metrics=metrics,
                 error_message=err,
+                group_size=group_size,
+                consent_all_yes=consent_all_yes,
             )
             st.error(f"Generation failed: {err}")
 
@@ -950,7 +1093,15 @@ if "draft_bytes" in st.session_state:
             used_prompt = st.session_state.get("last_prompt_used", prompt).strip() or prompt.strip()
             metrics = st.session_state.get("draft_metrics", {}) or {}
 
-            gallery_id = save_submission(team_name or "Anonymous", used_prompt, img, metrics=metrics)
+            gallery_id = save_submission(
+                team=team_name or "Anonymous",
+                prompt=used_prompt,
+                img=img,
+                session_id=session_id,
+                group_size=group_size,
+                consent_all_yes=consent_all_yes,
+                metrics=metrics,
+            )
 
             if st.session_state.get("draft_log_id") is not None:
                 dt_ms = None
