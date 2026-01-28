@@ -33,14 +33,14 @@ IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 TASK_BYLINE = (
     "Create a few photorealistic, everyday student-life scenes showing a student who might be lonely. "
-    "Vary the situation across prompts."
-    "Write your prompt in third person ("A student.."). Include:"
-    "The student's experience (socially, emotionally or otherwise)"
-    "Context (i.e. where/when, what is happening)"
-    "A few visual cues (i.e. posture, gaze, social dynamics, lighting)"
-    "Constraints: Photorealistic, documentary-style etc" 
-    
-    "You can choose whether to submit or discard the image. Only submitted images will be shown in the gallery."
+    "Vary the situation across prompts.\n\n"
+    "Write your prompt in third person (e.g., “A student…”). Include:\n"
+    "• The student’s experience (socially, emotionally, or otherwise)\n"
+    "• Context (where/when, what is happening)\n"
+    "• 2–3 visual cues (posture, gaze, distance to others, objects, lighting)\n"
+    "• Constraints (photorealistic, candid documentary style, natural colors; no text/watermark)\n\n"
+    "Quick check: avoid stereotypes (don’t assume gender/background unless it matters to the scene).\n\n"
+    "You can choose to submit or discard each image. Only submitted images appear in the gallery. "
     "Submit up to 2 images per group."
 )
 
