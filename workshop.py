@@ -31,7 +31,8 @@ HOST_PASSWORD = "admin123"
 MAX_CONCURRENT_GEN = 8
 IMAGE_MODEL = "gemini-3-pro-image-preview"
 
-TASK_BYLINE = """
+# Show task instructions ONLY on the prompt page (not during consent/setup)
+TASK_INSTRUCTIONS = """
 Create a few photorealistic, everyday student-life scenes showing a student who might be lonely.  
 Vary the situation across prompts.
 
@@ -46,7 +47,6 @@ Quick check: avoid stereotypes (don’t assume gender/background unless it matte
 You can choose to submit or discard each image. Only submitted images appear in the gallery.  
 Submit up to **2** images per group.
 """
-
 
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
 
@@ -245,7 +245,6 @@ def upsert_session_meta(
         )
         conn.commit()
 
-
 # ============================================================
 # IMAGE HELPERS
 # ============================================================
@@ -260,7 +259,6 @@ def safe_filename(s: str, maxlen: int = 60) -> str:
     s = re.sub(r"[^\w\-]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return (s[:maxlen] or "item")
-
 
 # ============================================================
 # GEMINI HELPERS
@@ -357,7 +355,6 @@ def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> Dict[str, A
         "metrics": metrics,
     }
 
-
 # ============================================================
 # GENERATION LOG
 # ============================================================
@@ -441,7 +438,6 @@ def finalize_generation_log(
             (status, decision_time_ms, gallery_id, log_id),
         )
         conn.commit()
-
 
 # ============================================================
 # DB OPERATIONS (gallery = submitted only)
@@ -625,7 +621,6 @@ def normalize_layout(layout_containers: List[Dict[str, Any]]) -> Tuple[Tuple[str
         out.append((c["header"], tuple(ids)))
     return tuple(out)
 
-
 # ============================================================
 # DOWNLOAD HELPERS
 # ============================================================
@@ -712,12 +707,10 @@ def export_zip_bytes(include_csv: bool = True, include_log: bool = True, include
     zbuf.seek(0)
     return zbuf.getvalue()
 
-
 # ============================================================
-# UI HEADER
+# UI HEADER (TITLE ONLY — no task text during consent/setup)
 # ============================================================
 st.title("Engineering loneliness with GenAI")
-st.markdown(f"**Task:** {TASK_BYLINE}")
 
 # ============================================================
 # HOST MODE
@@ -891,6 +884,7 @@ def reset_participant_state():
         "last_prompt_used",
         "consent_all_yes",
         "consent_choices",
+        "submitted_count",
     ]
     for k in keys:
         st.session_state.pop(k, None)
@@ -914,6 +908,7 @@ st.session_state.setdefault("session_id", str(uuid.uuid4()))
 st.session_state.setdefault("attempt_index", 0)
 st.session_state.setdefault("consent_choices", None)
 st.session_state.setdefault("consent_all_yes", None)
+st.session_state.setdefault("submitted_count", 0)
 
 # ---------- SETUP FLOW (multi-page, one person at a time) ----------
 if not st.session_state["setup_complete"]:
@@ -936,10 +931,10 @@ if not st.session_state["setup_complete"]:
             if st.button("Next"):
                 st.session_state["group_size"] = n
                 st.session_state["consent_index"] = 0
-                st.session_state["consent_choices"] = [""] * n  # stored privately, never displayed
+                st.session_state["consent_choices"] = [""] * n
                 st.session_state["consent_all_yes"] = None
+                st.session_state["submitted_count"] = 0
 
-                # new session_id for this run
                 st.session_state["session_id"] = str(uuid.uuid4())
                 st.session_state["setup_phase"] = "consent"
                 st.rerun()
@@ -956,7 +951,6 @@ if not st.session_state["setup_complete"]:
         st.subheader(f"Consent (Person {person_num} of {n})")
         st.markdown(CONSENT_TEXT)
 
-        # Use a selectbox so the choice must be made explicitly.
         choice = st.selectbox(
             "Select your answer",
             options=["Select…", "No", "Yes"],
@@ -976,22 +970,19 @@ if not st.session_state["setup_complete"]:
                 if choice == "Select…":
                     st.warning("Please select Yes or No to continue.")
                 else:
-                    # record privately
                     choices = st.session_state["consent_choices"] or [""] * n
                     choices[idx] = choice
                     st.session_state["consent_choices"] = choices
 
-                    # compute provisional all_yes only when all filled
                     filled = all(c in ("Yes", "No") for c in choices)
                     all_yes = filled and all(c == "Yes" for c in choices)
                     st.session_state["consent_all_yes"] = all_yes if filled else None
 
-                    # persist progressively (team_name may still be blank here)
                     upsert_session_meta(
                         session_id=st.session_state["session_id"],
                         team_name=st.session_state.get("team_name", "") or "",
                         group_size=n,
-                        consent_all_yes=all_yes if filled else False,  # store False until fully known
+                        consent_all_yes=all_yes if filled else False,
                         consent_choices=choices,
                     )
 
@@ -1017,17 +1008,16 @@ if not st.session_state["setup_complete"]:
             else:
                 st.session_state["team_name"] = group.strip()
                 st.session_state["attempt_index"] = 0
+                st.session_state["submitted_count"] = 0
 
                 n = int(st.session_state["group_size"])
                 choices = st.session_state["consent_choices"] or [""] * n
-                # If someone somehow skipped, treat blanks as "No" for safety in analysis
                 safe_choices = [(c if c in ("Yes", "No") else "No") for c in choices]
                 all_yes = all(c == "Yes" for c in safe_choices)
 
                 st.session_state["consent_choices"] = safe_choices
                 st.session_state["consent_all_yes"] = all_yes
 
-                # persist final meta with the correct team_name and consent_all_yes
                 upsert_session_meta(
                     session_id=st.session_state["session_id"],
                     team_name=st.session_state["team_name"],
@@ -1050,7 +1040,7 @@ consent_all_yes = st.session_state.get("consent_all_yes")
 with st.sidebar:
     st.header("Your info")
     st.success(f"Group: {team_name}")
-    # IMPORTANT: no consent status shown to participants
+    # no consent status shown to participants
 
 # Secrets check
 if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
@@ -1059,9 +1049,16 @@ if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
 
 api_key = st.secrets["google_api"]["key"]
 
-st.caption(f"Submitting as: **{team_name}**")
+# Task instructions ONLY here (prompting page)
+st.markdown("---")
+st.markdown(TASK_INSTRUCTIONS)
 
-prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic documentary photograph of...")
+# Soft counter only (NO enforcement)
+submitted_count = int(st.session_state.get("submitted_count", 0))
+st.caption(f"Submitted so far (this session): **{submitted_count}**")
+st.caption("Tip: aim for 1–2 submissions at a time; you can submit more later after discussion/refinement.")
+
+prompt = st.text_area("Prompt", height=220, placeholder="Photorealistic documentary photograph of...")
 
 # Generate (synchronous)
 if st.button("Generate image", key="gen_btn"):
@@ -1153,6 +1150,8 @@ if "draft_bytes" in st.session_state:
                     gallery_id=gallery_id,
                 )
 
+            st.session_state["submitted_count"] = int(st.session_state.get("submitted_count", 0)) + 1
+
             st.session_state.pop("draft_bytes", None)
             st.session_state.pop("draft_metrics", None)
             st.session_state.pop("draft_log_id", None)
@@ -1176,5 +1175,6 @@ if "draft_bytes" in st.session_state:
 
             st.info("Discarded. You can generate again.")
             st.rerun()
+
 
 
