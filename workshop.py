@@ -38,7 +38,7 @@ Vary the situation across prompts.
 
 Write your prompt in third person (e.g., “A student…”). Include:
 - The student’s experience (socially, emotionally, or otherwise)
-- Context (where/when, what is happening)
+- Context (who is involved, where does it take place, what is happening)
 - 2–3 visual cues (posture, gaze, distance to others, objects, lighting)
 - Constraints (photorealistic, candid documentary style, natural colors; **no text/watermark**)
 
