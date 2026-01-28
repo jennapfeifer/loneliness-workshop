@@ -33,8 +33,15 @@ IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 TASK_BYLINE = (
     "Create a few photorealistic, everyday student-life scenes showing a student who might be lonely. "
-    "Try to inject context (e.g., home, study location, otherwise), and try to inject the student's experience "
-    "(socially, emotionally, or otherwise). Try to vary the situations as much as possible."
+    "Vary the situation across prompts."
+    "Write your prompt in third person ("A student.."). Include:"
+    "The student's experience (socially, emotionally or otherwise)"
+    "Context (i.e. where/when, what is happening)"
+    "A few visual cues (i.e. posture, gaze, social dynamics, lighting)"
+    "Constraints: Photorealistic, documentary-style etc" 
+    
+    "You can choose whether to submit or discard the image. Only submitted images will be shown in the gallery."
+    "Submit up to 2 images per group."
 )
 
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
@@ -1049,10 +1056,6 @@ if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
 api_key = st.secrets["google_api"]["key"]
 
 st.caption(f"Submitting as: **{team_name}**")
-st.markdown(
-    "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment, "
-    "natural light, and a candid, everyday feel."
-)
 
 prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic documentary photograph of...")
 
