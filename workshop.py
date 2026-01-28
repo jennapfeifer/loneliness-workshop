@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import threading
-import concurrent.futures  # kept (even though we generate synchronously now)
+import concurrent.futures  # kept (even though generation is synchronous)
 import sqlite3
 import re
 import zipfile
@@ -28,16 +28,15 @@ st.set_page_config(
 DB_PATH = "workshop.db"
 HOST_PASSWORD = "admin123"
 
-MAX_CONCURRENT_GEN = 8  # across all users on this Streamlit instance
+MAX_CONCURRENT_GEN = 8
 IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 TASK_BYLINE = (
     "Create a few photorealistic, everyday student-life scenes showing a student who might be lonely. "
-    "Try to specify the context (e.g., home, study location, otherwise), and the student's experience "
+    "Try to inject context (e.g., home, study location, otherwise), and try to inject the student's experience "
     "(socially, emotionally, or otherwise). Try to vary the situations as much as possible."
-    "After the image has been generated, please either sbumit or discard it."
-    "Submit up to two images per group."
 )
+
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
 
 CONSENT_TEXT = """**Before you start**
@@ -53,7 +52,7 @@ The workshop includes a research component conducted by Jenna Pfeifer, PhD candi
 The aim of the research is to investigate how young people conceptualise and recognise loneliness.  
 For questions, contact: j.pfeifer@tudelft.nl.
 
-**May the research team store and use your prompts and corresponding AI-generated images for future research and publications?**
+**May the research team store and use your prompts, corresponding AI-generated images, and ratings for future research and publications?**
 """
 
 # ============================================================
@@ -61,7 +60,7 @@ For questions, contact: j.pfeifer@tudelft.nl.
 # ============================================================
 def qp_get(name: str, default: str = "") -> str:
     try:
-        v = st.query_params.get(name, default)  # new API
+        v = st.query_params.get(name, default)
         if isinstance(v, (list, tuple)):
             return str(v[0]) if v else default
         return str(v)
@@ -87,17 +86,14 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")  # ms
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 
 @st.cache_resource(show_spinner=False)
 def init_db_once() -> bool:
-    """
-    Initialize/migrate DB once per server process (NOT on every rerun).
-    """
     with get_conn() as conn:
-        # --- Main gallery table (only submitted images)
+        # --- gallery (submitted images only)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS gallery (
@@ -110,7 +106,7 @@ def init_db_once() -> bool:
             """
         )
 
-        # --- MIGRATION: host curation fields
+        # host curation migrations
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
         added_host_cluster = False
         added_host_rank = False
@@ -121,19 +117,17 @@ def init_db_once() -> bool:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_rank INTEGER")
             added_host_rank = True
 
-        # --- MIGRATION: add per-image metrics + consent/session fields
+        # gallery: session/consent + metrics migrations
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
 
         def add_gallery_col(name: str, ddl: str):
             if name not in cols:
                 conn.execute(f"ALTER TABLE gallery ADD COLUMN {ddl}")
 
-        # session/consent fields
         add_gallery_col("session_id", "session_id TEXT")
         add_gallery_col("group_size", "group_size INTEGER")
         add_gallery_col("consent_all_yes", "consent_all_yes INTEGER")
 
-        # metrics fields
         add_gallery_col("model_name", "model_name TEXT")
         add_gallery_col("latency_ms", "latency_ms REAL")
         add_gallery_col("queue_wait_ms", "queue_wait_ms REAL")
@@ -145,13 +139,12 @@ def init_db_once() -> bool:
         add_gallery_col("prompt_words", "prompt_words INTEGER")
         add_gallery_col("image_bytes", "image_bytes INTEGER")
 
-        # Backfills only if columns were added (avoid full-table UPDATE every rerun)
         if added_host_cluster:
             conn.execute("UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''")
         if added_host_rank:
             conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
 
-        # --- generation_log table (logs EVERY attempt, including discarded)
+        # --- generation_log (all attempts)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS generation_log (
@@ -182,7 +175,7 @@ def init_db_once() -> bool:
             """
         )
 
-        # --- MIGRATION: add consent fields to generation_log
+        # generation_log: consent migrations
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(generation_log)")]
 
         def add_log_col(name: str, ddl: str):
@@ -192,7 +185,7 @@ def init_db_once() -> bool:
         add_log_col("group_size", "group_size INTEGER")
         add_log_col("consent_all_yes", "consent_all_yes INTEGER")
 
-        # --- session_meta table (one row per session to store per-person consent)
+        # --- session_meta (per-person consent)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS session_meta (
@@ -292,10 +285,6 @@ def _extract_usage_tokens(response) -> Dict[str, Optional[int]]:
 
 
 def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> Dict[str, Any]:
-    """
-    Never raises. Returns dict:
-      { ok: bool, image_bytes: bytes|None, error: str|None, metrics: dict }
-    """
     sem = global_gen_semaphore()
 
     t0 = time.perf_counter()
@@ -720,7 +709,7 @@ st.title("Engineering loneliness with GenAI")
 st.markdown(f"**Task:** {TASK_BYLINE}")
 
 # ============================================================
-# HOST MODE (hidden unless ?host=1)
+# HOST MODE
 # ============================================================
 if HOST_FLAG:
     try:
@@ -766,8 +755,10 @@ if HOST_FLAG:
     meta_by_id = {int(m["id"]): m for m in meta}
 
     with st.sidebar.expander("Lookup (image # → team)", expanded=False):
-        st.dataframe([{"id": m["id"], "team_name": m["team_name"], "consent_all_yes": m.get("consent_all_yes")} for m in meta],
-                     use_container_width=True)
+        st.dataframe(
+            [{"id": m["id"], "team_name": m["team_name"], "consent_all_yes": m.get("consent_all_yes")} for m in meta],
+            use_container_width=True,
+        )
 
     by_cluster = {b: [] for b in buckets}
     for m in meta:
@@ -819,8 +810,6 @@ if HOST_FLAG:
                             if reveal_prompt:
                                 st.write(f"**Prompt:** {m.get('prompt','')}")
                             st.write(f"**Consent all yes:** {m.get('consent_all_yes')}")
-                            if not reveal_team and not reveal_prompt:
-                                st.caption("Details hidden (enable reveal toggles in the sidebar).")
 
     if view == "Curate (drag & drop)":
         st.subheader("Drag & drop to cluster and reorder")
@@ -841,34 +830,30 @@ if HOST_FLAG:
     if view == "Download":
         st.subheader("Download gallery data")
 
-        gallery_csv = export_gallery_csv_bytes()
         st.download_button(
-            "Download gallery_metadata.csv (submitted images + metrics + consent flags)",
-            data=gallery_csv,
+            "Download gallery_metadata.csv (submitted images + consent flags)",
+            data=export_gallery_csv_bytes(),
             file_name="gallery_metadata.csv",
             mime="text/csv",
         )
 
-        genlog_csv = export_generation_log_csv_bytes()
         st.download_button(
             "Download generation_log.csv (all attempts incl. discarded)",
-            data=genlog_csv,
+            data=export_generation_log_csv_bytes(),
             file_name="generation_log.csv",
             mime="text/csv",
         )
 
-        session_meta_csv = export_session_meta_csv_bytes()
         st.download_button(
             "Download session_meta.csv (per-person consent choices)",
-            data=session_meta_csv,
+            data=export_session_meta_csv_bytes(),
             file_name="session_meta.csv",
             mime="text/csv",
         )
 
-        zip_bytes = export_zip_bytes(include_csv=True, include_log=True, include_session_meta=True)
         st.download_button(
             "Download ZIP (images + CSVs)",
-            data=zip_bytes,
+            data=export_zip_bytes(include_csv=True, include_log=True, include_session_meta=True),
             file_name="gallery_images_and_metadata.zip",
             mime="application/zip",
         )
@@ -877,11 +862,13 @@ if HOST_FLAG:
         st.stop()
 
 # ============================================================
-# PARTICIPANT MODE (default)
+# PARTICIPANT MODE
 # ============================================================
 def reset_participant_state():
     keys = [
         "setup_complete",
+        "setup_phase",
+        "consent_index",
         "group_size",
         "team_name",
         "session_id",
@@ -897,11 +884,6 @@ def reset_participant_state():
     for k in keys:
         st.session_state.pop(k, None)
 
-    # also clear consent keys
-    for k in list(st.session_state.keys()):
-        if str(k).startswith("consent_choice_"):
-            st.session_state.pop(k, None)
-
 
 with st.sidebar:
     st.header("Setup")
@@ -909,87 +891,144 @@ with st.sidebar:
         reset_participant_state()
         st.rerun()
     st.divider()
-    st.caption("Tip: If the app ever feels stuck, restart setup to clear in-progress state.")
+    st.caption("If the app feels stuck, restart setup to clear in-progress state.")
 
-
+# defaults
 st.session_state.setdefault("setup_complete", False)
+st.session_state.setdefault("setup_phase", "group_size")  # group_size -> consent -> group_name
+st.session_state.setdefault("consent_index", 0)
 st.session_state.setdefault("group_size", 1)
 st.session_state.setdefault("team_name", "")
 st.session_state.setdefault("session_id", str(uuid.uuid4()))
 st.session_state.setdefault("attempt_index", 0)
-st.session_state.setdefault("consent_all_yes", None)
 st.session_state.setdefault("consent_choices", None)
+st.session_state.setdefault("consent_all_yes", None)
 
-# ---------- SETUP FLOW ----------
+# ---------- SETUP FLOW (multi-page, one person at a time) ----------
 if not st.session_state["setup_complete"]:
-    st.subheader("Welcome")
+    phase = st.session_state["setup_phase"]
 
-    # Step 1: group size
-    n = int(
-        st.number_input(
-            "How many people are in your group?",
-            min_value=1,
-            max_value=20,
-            value=max(1, int(st.session_state.get("group_size") or 1)),
-            step=1,
+    if phase == "group_size":
+        st.subheader("Welcome")
+        n = int(
+            st.number_input(
+                "How many people are in your group?",
+                min_value=1,
+                max_value=20,
+                value=max(1, int(st.session_state.get("group_size") or 1)),
+                step=1,
+            )
         )
-    )
-    st.session_state["group_size"] = n
 
-    st.markdown("### Consent")
-    st.markdown("Please complete consent for **each person** in your group.")
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("Next"):
+                st.session_state["group_size"] = n
+                st.session_state["consent_index"] = 0
+                st.session_state["consent_choices"] = [""] * n  # stored privately, never displayed
+                st.session_state["consent_all_yes"] = None
 
-    consent_choices: List[str] = []
-    all_yes = True
+                # new session_id for this run
+                st.session_state["session_id"] = str(uuid.uuid4())
+                st.session_state["setup_phase"] = "consent"
+                st.rerun()
+        with col2:
+            st.caption("Next you will complete consent privately, one person at a time.")
 
-    for i in range(1, n + 1):
-        st.markdown(f"#### Person {i}")
+        st.stop()
+
+    if phase == "consent":
+        n = int(st.session_state["group_size"])
+        idx = int(st.session_state["consent_index"])
+        person_num = idx + 1
+
+        st.subheader(f"Consent (Person {person_num} of {n})")
         st.markdown(CONSENT_TEXT)
 
-        choice = st.radio(
-            f"Consent (Person {i})",
-            options=["No", "Yes"],
-            index=0,  # default = No (safe)
-            horizontal=True,
-            key=f"consent_choice_{i}",
+        # Use a selectbox so the choice must be made explicitly.
+        choice = st.selectbox(
+            "Select your answer",
+            options=["Select…", "No", "Yes"],
+            index=0,
+            key=f"consent_choice_person_{person_num}",
         )
-        consent_choices.append(choice)
-        if choice != "Yes":
-            all_yes = False
 
-        st.divider()
+        col_a, col_b, col_c = st.columns([1, 1, 3])
 
+        with col_a:
+            if st.button("Back") and idx > 0:
+                st.session_state["consent_index"] = idx - 1
+                st.rerun()
 
-    st.markdown("### Group name")
-    group = st.text_input("Enter your group name", placeholder="e.g., Team Blue", value=st.session_state.get("team_name", ""))
+        with col_b:
+            if st.button("Next"):
+                if choice == "Select…":
+                    st.warning("Please select Yes or No to continue.")
+                else:
+                    # record privately
+                    choices = st.session_state["consent_choices"] or [""] * n
+                    choices[idx] = choice
+                    st.session_state["consent_choices"] = choices
 
-    proceed = st.button("Continue")
+                    # compute provisional all_yes only when all filled
+                    filled = all(c in ("Yes", "No") for c in choices)
+                    all_yes = filled and all(c == "Yes" for c in choices)
+                    st.session_state["consent_all_yes"] = all_yes if filled else None
 
-    if proceed:
-        if not group.strip():
-            st.error("Please enter a group name.")
-        else:
-            st.session_state["team_name"] = group.strip()
-            # new session_id for this run (so consent ties cleanly to this session)
-            st.session_state["session_id"] = str(uuid.uuid4())
-            st.session_state["attempt_index"] = 0
+                    # persist progressively (team_name may still be blank here)
+                    upsert_session_meta(
+                        session_id=st.session_state["session_id"],
+                        team_name=st.session_state.get("team_name", "") or "",
+                        group_size=n,
+                        consent_all_yes=all_yes if filled else False,  # store False until fully known
+                        consent_choices=choices,
+                    )
 
-            st.session_state["consent_all_yes"] = all_yes
-            st.session_state["consent_choices"] = consent_choices
+                    if idx + 1 < n:
+                        st.session_state["consent_index"] = idx + 1
+                        st.rerun()
+                    else:
+                        st.session_state["setup_phase"] = "group_name"
+                        st.rerun()
 
-            # persist consent immediately
-            upsert_session_meta(
-                session_id=st.session_state["session_id"],
-                team_name=st.session_state["team_name"],
-                group_size=n,
-                consent_all_yes=all_yes,
-                consent_choices=consent_choices,
-            )
+        with col_c:
+            st.caption("This screen is intended to be completed by one person at a time.")
 
-            st.session_state["setup_complete"] = True
-            st.rerun()
+        st.stop()
 
-    st.stop()
+    if phase == "group_name":
+        st.subheader("Group name")
+        group = st.text_input("Enter your group name", placeholder="e.g., Team Blue", value=st.session_state.get("team_name", ""))
+
+        if st.button("Continue"):
+            if not group.strip():
+                st.error("Please enter a group name.")
+            else:
+                st.session_state["team_name"] = group.strip()
+                st.session_state["attempt_index"] = 0
+
+                n = int(st.session_state["group_size"])
+                choices = st.session_state["consent_choices"] or [""] * n
+                # If someone somehow skipped, treat blanks as "No" for safety in analysis
+                safe_choices = [(c if c in ("Yes", "No") else "No") for c in choices]
+                all_yes = all(c == "Yes" for c in safe_choices)
+
+                st.session_state["consent_choices"] = safe_choices
+                st.session_state["consent_all_yes"] = all_yes
+
+                # persist final meta with the correct team_name and consent_all_yes
+                upsert_session_meta(
+                    session_id=st.session_state["session_id"],
+                    team_name=st.session_state["team_name"],
+                    group_size=n,
+                    consent_all_yes=all_yes,
+                    consent_choices=safe_choices,
+                )
+
+                st.session_state["setup_complete"] = True
+                st.rerun()
+
+        st.stop()
 
 # ---------- MAIN APP ----------
 team_name = st.session_state["team_name"]
@@ -1000,10 +1039,7 @@ consent_all_yes = st.session_state.get("consent_all_yes")
 with st.sidebar:
     st.header("Your info")
     st.success(f"Group: {team_name}")
-    if consent_all_yes is False:
-        st.warning("Consent: NOT fully consented (you can exclude this session later).")
-    elif consent_all_yes is True:
-        st.success("Consent: fully consented")
+    # IMPORTANT: no consent status shown to participants
 
 # Secrets check
 if "google_api" not in st.secrets or "key" not in st.secrets["google_api"]:
@@ -1014,17 +1050,18 @@ api_key = st.secrets["google_api"]["key"]
 
 st.caption(f"Submitting as: **{team_name}**")
 st.markdown(
-    "**Prompt tip:** Start with *“Photorealistic photograph…”* and specify a real moment, "
+    "**Prompt tip:** Start with *“Photorealistic documentary photograph…”* and specify a real moment, "
+    "natural light, and a candid, everyday feel."
 )
 
-prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic photograph of...")
+prompt = st.text_area("Prompt", height=180, placeholder="Photorealistic documentary photograph of...")
 
-# Generate (synchronous; avoids rerun polling loops)
+# Generate (synchronous)
 if st.button("Generate image", key="gen_btn"):
     if not prompt.strip():
         st.warning("Please write a prompt.")
     else:
-        # If there is an existing unsubmitted draft, treat it as discarded when generating a new one
+        # discard prior draft if any
         if st.session_state.get("draft_log_id") is not None:
             dt_ms = None
             if st.session_state.get("draft_ready_at") is not None:
@@ -1132,6 +1169,5 @@ if "draft_bytes" in st.session_state:
 
             st.info("Discarded. You can generate again.")
             st.rerun()
-
 
 
