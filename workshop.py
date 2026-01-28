@@ -42,8 +42,6 @@ Write your prompt in third person (e.g., “A student…”). Include:
 - 2–3 visual cues (posture, gaze, distance to others, objects, lighting)
 - Constraints (photorealistic, candid documentary style, natural colors; **no text/watermark**)
 
-Quick check: avoid stereotypes (don’t assume gender/background unless it matters to the scene).
-
 You can choose to submit or discard each image. Only submitted images appear in the gallery.  
 Submit up to **2** images per group.
 """
