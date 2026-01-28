@@ -53,7 +53,7 @@ The workshop includes a research component conducted by Jenna Pfeifer, PhD candi
 The aim of the research is to investigate how young people conceptualise and recognise loneliness.  
 For questions, contact: j.pfeifer@tudelft.nl.
 
-**May the research team store and use your prompts, corresponding AI-generated images, and ratings for future research and publications?**
+**May the research team store and use your prompts and corresponding AI-generated images for future research and publications?**
 """
 
 # ============================================================
