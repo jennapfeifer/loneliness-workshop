@@ -33,16 +33,17 @@ IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 # Show task instructions ONLY on the prompt page (not during consent/setup)
 TASK_INSTRUCTIONS = """
-Create a few photorealistic everyday scenes showing a young adult who might be lonely.  
-Vary the situation across prompts (home, university, work, transit, social settings, public spaces) and vary appearance (i.e. gender presentation, ethnicity, clothing style) to avoid repetition.
+Create a few photorealistic everyday scenes showing a young adult who might be lonely.
 
 Write your prompt in third person (e.g., “A young adult…”). Include:
 - The person’s emotional experience without simply labeling them “lonely”
 - Context (who is involved, where does it take place, what is happening)
-- A few visual cues (i.e. posture, gaze, distance to others, objects, lighting)
+- A few visual cues (posture, gaze, distance to others, objects, lighting)
 - Constraints (photorealistic, candid documentary style, natural colors; **no text/watermark**)
 
-You can choose to submit or discard each image. Only submitted images appear in the gallery.  
+Try to vary the situation across prompts (home, university, work, transit, social settings, public spaces) and vary appearance (i.e. gender presentation, ethnicity, clothing style) to avoid repetition.
+
+You can choose to submit or discard each image. Only submitted images appear in the gallery.
 Submit up to **2** images per group.
 """
 
