@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 import threading
-import concurrent.futures  # kept (even though generation is synchronous)
 import sqlite3
 import re
 import zipfile
@@ -33,13 +32,14 @@ IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 # Show task instructions ONLY on the prompt page (not during consent/setup)
 TASK_INSTRUCTIONS = """
-
-Create photorealistic, everyday scenes of a young adult who might be lonely. 
-Write in third person and describe the moment with a bit of context and a few observable details (i.e. posture, gaze, spacing, objects, lighting). 
+Create photorealistic, everyday scenes of a young adult who might be lonely.  
+Write in third person and describe the moment with a bit of context and a few observable details (e.g., posture, gaze, spacing, objects, lighting).  
 Candid documentary style, natural colors; no text/watermark.
 
-You can choose to submit or discard each image. Only submitted images appear in the gallery.
-Submit up to **2** images per group.
+You can discuss prompt ideas and generated previews with others, but **please submit individually on your own device**.
+
+You can choose to submit or discard each image. Only submitted images appear in the gallery.  
+Submit up to **2** images per person.
 """
 
 DEFAULT_BUCKETS = "Unsorted, Interesting, Maybe, Other"
@@ -48,6 +48,8 @@ CONSENT_TEXT = """**Before you start**
 
 In this activity, you will enter prompts that are sent to an AI provider to generate images.  
 The AI provider will not use your prompts for model training.
+
+You are welcome to discuss prompt ideas and generated images with someone else, but **please submit your prompts and images individually on your own device**.
 
 This is a voluntary workshop activity; you can stop at any time without negative consequences.
 
@@ -103,7 +105,13 @@ def init_db_once() -> bool:
             """
             CREATE TABLE IF NOT EXISTS gallery (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- legacy name (kept for backward compatibility)
                 team_name TEXT,
+
+                -- preferred name (single participant)
+                participant_name TEXT,
+
                 prompt TEXT,
                 image_blob BLOB,
                 created_at TEXT DEFAULT (datetime('now'))
@@ -113,16 +121,12 @@ def init_db_once() -> bool:
 
         # host curation migrations
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
-        added_host_cluster = False
-        added_host_rank = False
         if "host_cluster" not in cols:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_cluster TEXT DEFAULT 'Unsorted'")
-            added_host_cluster = True
         if "host_rank" not in cols:
             conn.execute("ALTER TABLE gallery ADD COLUMN host_rank INTEGER")
-            added_host_rank = True
 
-        # gallery: session/consent + metrics migrations
+        # consent + session + metrics migrations
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
 
         def add_gallery_col(name: str, ddl: str):
@@ -130,8 +134,8 @@ def init_db_once() -> bool:
                 conn.execute(f"ALTER TABLE gallery ADD COLUMN {ddl}")
 
         add_gallery_col("session_id", "session_id TEXT")
-        add_gallery_col("group_size", "group_size INTEGER")
-        add_gallery_col("consent_all_yes", "consent_all_yes INTEGER")
+        add_gallery_col("group_size", "group_size INTEGER")          # kept (always 1)
+        add_gallery_col("consent_all_yes", "consent_all_yes INTEGER") # kept (per-person yes/no)
 
         add_gallery_col("model_name", "model_name TEXT")
         add_gallery_col("latency_ms", "latency_ms REAL")
@@ -144,10 +148,19 @@ def init_db_once() -> bool:
         add_gallery_col("prompt_words", "prompt_words INTEGER")
         add_gallery_col("image_bytes", "image_bytes INTEGER")
 
-        if added_host_cluster:
-            conn.execute("UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''")
-        if added_host_rank:
-            conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
+        # ensure preferred column exists even on older DBs
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(gallery)")]
+        if "participant_name" not in cols:
+            conn.execute("ALTER TABLE gallery ADD COLUMN participant_name TEXT")
+
+        # backfill participant_name from team_name if needed
+        conn.execute(
+            """
+            UPDATE gallery
+            SET participant_name = COALESCE(participant_name, team_name)
+            WHERE participant_name IS NULL OR participant_name = ''
+            """
+        )
 
         # --- generation_log (all attempts)
         conn.execute(
@@ -155,7 +168,13 @@ def init_db_once() -> bool:
             CREATE TABLE IF NOT EXISTS generation_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
+
+                -- legacy (kept)
                 team_name TEXT,
+
+                -- preferred (single participant)
+                participant_name TEXT,
+
                 attempt_index INTEGER,
                 prompt TEXT,
                 status TEXT,  -- generated | submitted | discarded | error
@@ -175,27 +194,40 @@ def init_db_once() -> bool:
                 image_bytes INTEGER,
 
                 error_message TEXT,
-                gallery_id INTEGER
+                gallery_id INTEGER,
+
+                group_size INTEGER,          -- kept (always 1)
+                consent_all_yes INTEGER      -- kept (per-person yes/no)
             )
             """
         )
 
-        # generation_log: consent migrations
+        # ensure preferred column exists even on older DBs
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(generation_log)")]
+        if "participant_name" not in cols:
+            conn.execute("ALTER TABLE generation_log ADD COLUMN participant_name TEXT")
 
-        def add_log_col(name: str, ddl: str):
-            if name not in cols:
-                conn.execute(f"ALTER TABLE generation_log ADD COLUMN {ddl}")
-
-        add_log_col("group_size", "group_size INTEGER")
-        add_log_col("consent_all_yes", "consent_all_yes INTEGER")
+        # backfill participant_name from team_name if needed
+        conn.execute(
+            """
+            UPDATE generation_log
+            SET participant_name = COALESCE(participant_name, team_name)
+            WHERE participant_name IS NULL OR participant_name = ''
+            """
+        )
 
         # --- session_meta (per-person consent)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS session_meta (
                 session_id TEXT PRIMARY KEY,
+
+                -- legacy (kept)
                 team_name TEXT,
+
+                -- preferred (single participant)
+                participant_name TEXT,
+
                 group_size INTEGER,
                 consent_all_yes INTEGER,
                 consent_choices_json TEXT,
@@ -203,6 +235,22 @@ def init_db_once() -> bool:
             )
             """
         )
+
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(session_meta)")]
+        if "participant_name" not in cols:
+            conn.execute("ALTER TABLE session_meta ADD COLUMN participant_name TEXT")
+
+        conn.execute(
+            """
+            UPDATE session_meta
+            SET participant_name = COALESCE(participant_name, team_name)
+            WHERE participant_name IS NULL OR participant_name = ''
+            """
+        )
+
+        # fix host fields defaults
+        conn.execute("UPDATE gallery SET host_cluster='Unsorted' WHERE host_cluster IS NULL OR host_cluster=''")
+        conn.execute("UPDATE gallery SET host_rank=id WHERE host_rank IS NULL")
 
         conn.commit()
     return True
@@ -213,27 +261,29 @@ init_db_once()
 
 def upsert_session_meta(
     session_id: str,
-    team_name: str,
-    group_size: int,
-    consent_all_yes: bool,
-    consent_choices: List[str],
+    participant_name: str,
+    consent_yes: bool,
 ):
+    # Keep the legacy columns too, but prefer participant_name going forward.
+    consent_choices = ["Yes" if consent_yes else "No"]
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO session_meta (session_id, team_name, group_size, consent_all_yes, consent_choices_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO session_meta (session_id, team_name, participant_name, group_size, consent_all_yes, consent_choices_json)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 team_name=excluded.team_name,
+                participant_name=excluded.participant_name,
                 group_size=excluded.group_size,
                 consent_all_yes=excluded.consent_all_yes,
                 consent_choices_json=excluded.consent_choices_json
             """,
             (
                 session_id,
-                team_name,
-                int(group_size),
-                1 if consent_all_yes else 0,
+                participant_name,  # legacy field
+                participant_name,  # preferred field
+                1,
+                1 if consent_yes else 0,
                 json.dumps(consent_choices),
             ),
         )
@@ -354,35 +404,34 @@ def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> Dict[str, A
 # ============================================================
 def insert_generation_log(
     session_id: str,
-    team: str,
+    participant_name: str,
     attempt_index: int,
     prompt: str,
     status: str,
     metrics: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
-    group_size: Optional[int] = None,
-    consent_all_yes: Optional[bool] = None,
+    consent_yes: Optional[bool] = None,
 ) -> int:
     metrics = metrics or {}
 
     consent_val = None
-    if consent_all_yes is True:
+    if consent_yes is True:
         consent_val = 1
-    elif consent_all_yes is False:
+    elif consent_yes is False:
         consent_val = 0
 
     with get_conn() as conn:
         cur = conn.execute(
             """
             INSERT INTO generation_log (
-                session_id, team_name, attempt_index, prompt, status,
+                session_id, team_name, participant_name, attempt_index, prompt, status,
                 model_name, latency_ms, queue_wait_ms, total_time_ms, decision_time_ms,
                 prompt_tokens, candidates_tokens, total_tokens,
                 prompt_chars, prompt_words, image_bytes,
                 error_message, gallery_id,
                 group_size, consent_all_yes
             )
-            VALUES (?, ?, ?, ?, ?,
+            VALUES (?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, NULL,
                     ?, ?, ?,
                     ?, ?, ?,
@@ -391,7 +440,8 @@ def insert_generation_log(
             """,
             (
                 session_id,
-                team,
+                participant_name,      # legacy field
+                participant_name,      # preferred field
                 attempt_index,
                 prompt,
                 status,
@@ -406,7 +456,7 @@ def insert_generation_log(
                 metrics.get("prompt_words"),
                 metrics.get("image_bytes"),
                 error_message,
-                group_size,
+                1,                     # group_size fixed
                 consent_val,
             ),
         )
@@ -437,27 +487,26 @@ def finalize_generation_log(
 # DB OPERATIONS (gallery = submitted only)
 # ============================================================
 def save_submission(
-    team: str,
+    participant_name: str,
     prompt: str,
     img: Image.Image,
     session_id: str,
-    group_size: Optional[int],
-    consent_all_yes: Optional[bool],
+    consent_yes: Optional[bool],
     metrics: Optional[Dict[str, Any]] = None,
 ) -> int:
     metrics = metrics or {}
 
     consent_val = None
-    if consent_all_yes is True:
+    if consent_yes is True:
         consent_val = 1
-    elif consent_all_yes is False:
+    elif consent_yes is False:
         consent_val = 0
 
     with get_conn() as conn:
         cur = conn.execute(
             """
             INSERT INTO gallery (
-                team_name, prompt, image_blob,
+                team_name, participant_name, prompt, image_blob,
                 host_cluster, host_rank,
                 session_id, group_size, consent_all_yes,
                 model_name, latency_ms, queue_wait_ms, total_time_ms,
@@ -465,7 +514,7 @@ def save_submission(
                 prompt_chars, prompt_words, image_bytes
             )
             VALUES (
-                ?, ?, ?,
+                ?, ?, ?, ?,
                 'Unsorted', NULL,
                 ?, ?, ?,
                 ?, ?, ?, ?,
@@ -474,11 +523,12 @@ def save_submission(
             )
             """,
             (
-                team,
+                participant_name,              # legacy field
+                participant_name,              # preferred field
                 prompt,
                 image_to_blob(img),
                 session_id,
-                group_size,
+                1,                             # group_size fixed
                 consent_val,
                 metrics.get("model_name"),
                 metrics.get("latency_ms"),
@@ -504,7 +554,7 @@ def get_gallery_meta(order_by: str = "curated") -> List[Dict[str, Any]]:
                 """
                 SELECT
                     id,
-                    COALESCE(team_name, '') AS team_name,
+                    COALESCE(participant_name, team_name, '') AS participant_name,
                     COALESCE(prompt, '') AS prompt,
                     COALESCE(created_at, '') AS created_at,
                     COALESCE(host_cluster, 'Unsorted') AS host_cluster,
@@ -533,7 +583,7 @@ def get_gallery_meta(order_by: str = "curated") -> List[Dict[str, Any]]:
                 """
                 SELECT
                     id,
-                    COALESCE(team_name, '') AS team_name,
+                    COALESCE(participant_name, team_name, '') AS participant_name,
                     COALESCE(prompt, '') AS prompt,
                     COALESCE(created_at, '') AS created_at,
                     COALESCE(host_cluster, 'Unsorted') AS host_cluster,
@@ -569,13 +619,53 @@ def get_gallery_blobs() -> Dict[int, bytes]:
 
 def get_generation_log_rows() -> List[Dict[str, Any]]:
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM generation_log ORDER BY id ASC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                session_id,
+                COALESCE(participant_name, team_name, '') AS participant_name,
+                attempt_index,
+                prompt,
+                status,
+                created_at,
+                model_name,
+                latency_ms,
+                queue_wait_ms,
+                total_time_ms,
+                decision_time_ms,
+                prompt_tokens,
+                candidates_tokens,
+                total_tokens,
+                prompt_chars,
+                prompt_words,
+                image_bytes,
+                error_message,
+                gallery_id,
+                group_size,
+                consent_all_yes
+            FROM generation_log
+            ORDER BY id ASC
+            """
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_session_meta_rows() -> List[Dict[str, Any]]:
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM session_meta ORDER BY created_at ASC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT
+                session_id,
+                COALESCE(participant_name, team_name, '') AS participant_name,
+                group_size,
+                consent_all_yes,
+                consent_choices_json,
+                created_at
+            FROM session_meta
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -624,7 +714,7 @@ def export_gallery_csv_bytes() -> bytes:
     meta = get_gallery_meta(order_by="curated")
     cols = [
         "id",
-        "team_name",
+        "participant_name",
         "prompt",
         "created_at",
         "host_cluster",
@@ -736,7 +826,7 @@ if HOST_FLAG:
 
         st.divider()
         st.subheader("Privacy")
-        reveal_team = st.toggle("Reveal team names (admin only)", value=False)
+        reveal_name = st.toggle("Reveal participant names (admin only)", value=False)
         reveal_prompt = st.toggle("Reveal prompts (admin only)", value=False)
         show_ids = st.toggle("Show image #", value=True)
 
@@ -752,9 +842,9 @@ if HOST_FLAG:
     blobs_by_id = get_gallery_blobs()
     meta_by_id = {int(m["id"]): m for m in meta}
 
-    with st.sidebar.expander("Lookup (image # → team)", expanded=False):
+    with st.sidebar.expander("Lookup (image # → participant)", expanded=False):
         st.dataframe(
-            [{"id": m["id"], "team_name": m["team_name"], "consent_all_yes": m.get("consent_all_yes")} for m in meta],
+            [{"id": m["id"], "participant_name": m["participant_name"], "consent_all_yes": m.get("consent_all_yes")} for m in meta],
             use_container_width=True,
         )
 
@@ -797,17 +887,17 @@ if HOST_FLAG:
                     if compact:
                         if show_ids:
                             cap = f"#{image_id}"
-                            if reveal_team:
-                                cap += f" • {m.get('team_name','')}"
+                            if reveal_name:
+                                cap += f" • {m.get('participant_name','')}"
                             st.caption(cap)
                     else:
                         header = f"Image #{image_id}" if show_ids else "Image"
                         with st.expander(header):
-                            if reveal_team:
-                                st.write(f"**Team:** {m.get('team_name','')}")
+                            if reveal_name:
+                                st.write(f"**Participant:** {m.get('participant_name','')}")
                             if reveal_prompt:
                                 st.write(f"**Prompt:** {m.get('prompt','')}")
-                            st.write(f"**Consent all yes:** {m.get('consent_all_yes')}")
+                            st.write(f"**Consent yes:** {m.get('consent_all_yes')}")
 
     if view == "Curate (drag & drop)":
         st.subheader("Drag & drop to cluster and reorder")
@@ -865,10 +955,7 @@ if HOST_FLAG:
 def reset_participant_state():
     keys = [
         "setup_complete",
-        "setup_phase",
-        "consent_index",
-        "group_size",
-        "team_name",
+        "participant_name",
         "session_id",
         "attempt_index",
         "draft_bytes",
@@ -876,9 +963,9 @@ def reset_participant_state():
         "draft_log_id",
         "draft_ready_at",
         "last_prompt_used",
-        "consent_all_yes",
-        "consent_choices",
+        "consent_yes",
         "submitted_count",
+        "group_size",
     ]
     for k in keys:
         st.session_state.pop(k, None)
@@ -894,146 +981,72 @@ with st.sidebar:
 
 # defaults
 st.session_state.setdefault("setup_complete", False)
-st.session_state.setdefault("setup_phase", "group_size")  # group_size -> consent -> group_name
-st.session_state.setdefault("consent_index", 0)
-st.session_state.setdefault("group_size", 1)
-st.session_state.setdefault("team_name", "")
+st.session_state.setdefault("participant_name", "")
 st.session_state.setdefault("session_id", str(uuid.uuid4()))
 st.session_state.setdefault("attempt_index", 0)
-st.session_state.setdefault("consent_choices", None)
-st.session_state.setdefault("consent_all_yes", None)
+st.session_state.setdefault("consent_yes", None)  # True/False
 st.session_state.setdefault("submitted_count", 0)
+st.session_state.setdefault("group_size", 1)      # fixed; retained for DB compatibility
 
-# ---------- SETUP FLOW (multi-page, one person at a time) ----------
+
+# ---------- SETUP FLOW (single person) ----------
 if not st.session_state["setup_complete"]:
-    phase = st.session_state["setup_phase"]
+    st.subheader("Welcome")
+    st.markdown(CONSENT_TEXT)
 
-    if phase == "group_size":
-        st.subheader("Welcome")
-        n = int(
-            st.number_input(
-                "How many people are in your group?",
-                min_value=1,
-                max_value=20,
-                value=max(1, int(st.session_state.get("group_size") or 1)),
-                step=1,
-            )
+    anon_name = st.text_input(
+        "Anonymous name",
+        placeholder="e.g., BlueSky12",
+        value=st.session_state.get("participant_name", ""),
+    )
+
+    choice = st.selectbox(
+        "Select your answer",
+        options=["Select…", "No", "Yes"],
+        index=0,
+        key="consent_choice_person_1",
+    )
+
+    st.caption("You can discuss ideas with others, but please submit individually using your own device.")
+
+    if st.button("Continue"):
+        if not anon_name.strip():
+            st.error("Please enter an anonymous name to continue.")
+            st.stop()
+        if choice == "Select…":
+            st.warning("Please select Yes or No to continue.")
+            st.stop()
+
+        consent_yes = (choice == "Yes")
+
+        st.session_state["participant_name"] = anon_name.strip()
+        st.session_state["consent_yes"] = consent_yes
+
+        # new session for this participant
+        st.session_state["session_id"] = str(uuid.uuid4())
+        st.session_state["attempt_index"] = 0
+        st.session_state["submitted_count"] = 0
+        st.session_state["group_size"] = 1
+
+        upsert_session_meta(
+            session_id=st.session_state["session_id"],
+            participant_name=st.session_state["participant_name"],
+            consent_yes=consent_yes,
         )
 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if st.button("Next"):
-                st.session_state["group_size"] = n
-                st.session_state["consent_index"] = 0
-                st.session_state["consent_choices"] = [""] * n
-                st.session_state["consent_all_yes"] = None
-                st.session_state["submitted_count"] = 0
+        st.session_state["setup_complete"] = True
+        st.rerun()
 
-                st.session_state["session_id"] = str(uuid.uuid4())
-                st.session_state["setup_phase"] = "consent"
-                st.rerun()
-        with col2:
-            st.caption("Next you will complete consent privately, one person at a time.")
-
-        st.stop()
-
-    if phase == "consent":
-        n = int(st.session_state["group_size"])
-        idx = int(st.session_state["consent_index"])
-        person_num = idx + 1
-
-        st.subheader(f"Consent (Person {person_num} of {n})")
-        st.markdown(CONSENT_TEXT)
-
-        choice = st.selectbox(
-            "Select your answer",
-            options=["Select…", "No", "Yes"],
-            index=0,
-            key=f"consent_choice_person_{person_num}",
-        )
-
-        col_a, col_b, col_c = st.columns([1, 1, 3])
-
-        with col_a:
-            if st.button("Back") and idx > 0:
-                st.session_state["consent_index"] = idx - 1
-                st.rerun()
-
-        with col_b:
-            if st.button("Next"):
-                if choice == "Select…":
-                    st.warning("Please select Yes or No to continue.")
-                else:
-                    choices = st.session_state["consent_choices"] or [""] * n
-                    choices[idx] = choice
-                    st.session_state["consent_choices"] = choices
-
-                    filled = all(c in ("Yes", "No") for c in choices)
-                    all_yes = filled and all(c == "Yes" for c in choices)
-                    st.session_state["consent_all_yes"] = all_yes if filled else None
-
-                    upsert_session_meta(
-                        session_id=st.session_state["session_id"],
-                        team_name=st.session_state.get("team_name", "") or "",
-                        group_size=n,
-                        consent_all_yes=all_yes if filled else False,
-                        consent_choices=choices,
-                    )
-
-                    if idx + 1 < n:
-                        st.session_state["consent_index"] = idx + 1
-                        st.rerun()
-                    else:
-                        st.session_state["setup_phase"] = "group_name"
-                        st.rerun()
-
-        with col_c:
-            st.caption("This screen is intended to be completed by one person at a time.")
-
-        st.stop()
-
-    if phase == "group_name":
-        st.subheader("Group name")
-        group = st.text_input("Enter your group name", placeholder="e.g., Team Blue", value=st.session_state.get("team_name", ""))
-
-        if st.button("Continue"):
-            if not group.strip():
-                st.error("Please enter a group name.")
-            else:
-                st.session_state["team_name"] = group.strip()
-                st.session_state["attempt_index"] = 0
-                st.session_state["submitted_count"] = 0
-
-                n = int(st.session_state["group_size"])
-                choices = st.session_state["consent_choices"] or [""] * n
-                safe_choices = [(c if c in ("Yes", "No") else "No") for c in choices]
-                all_yes = all(c == "Yes" for c in safe_choices)
-
-                st.session_state["consent_choices"] = safe_choices
-                st.session_state["consent_all_yes"] = all_yes
-
-                upsert_session_meta(
-                    session_id=st.session_state["session_id"],
-                    team_name=st.session_state["team_name"],
-                    group_size=n,
-                    consent_all_yes=all_yes,
-                    consent_choices=safe_choices,
-                )
-
-                st.session_state["setup_complete"] = True
-                st.rerun()
-
-        st.stop()
+    st.stop()
 
 # ---------- MAIN APP ----------
-team_name = st.session_state["team_name"]
+participant_name = st.session_state["participant_name"]
 session_id = st.session_state["session_id"]
-group_size = st.session_state.get("group_size")
-consent_all_yes = st.session_state.get("consent_all_yes")
+consent_yes = st.session_state.get("consent_yes")
 
 with st.sidebar:
     st.header("Your info")
-    st.success(f"Group: {team_name}")
+    st.success(f"Name: {participant_name}")
     # no consent status shown to participants
 
 # Secrets check
@@ -1050,7 +1063,6 @@ st.markdown(TASK_INSTRUCTIONS)
 # Soft counter only (NO enforcement)
 submitted_count = int(st.session_state.get("submitted_count", 0))
 st.caption(f"Submitted so far (this session): **{submitted_count}**")
-st.caption("Tip: aim for 1–2 submissions at a time; you can submit more later after discussion/refinement.")
 
 prompt = st.text_area("Prompt", height=220, placeholder="Photorealistic documentary photograph of...")
 
@@ -1086,28 +1098,26 @@ if st.button("Generate image", key="gen_btn"):
 
             log_id = insert_generation_log(
                 session_id=session_id,
-                team=team_name,
+                participant_name=participant_name,
                 attempt_index=attempt_index,
                 prompt=prompt.strip(),
                 status="generated",
                 metrics=metrics,
                 error_message=None,
-                group_size=group_size,
-                consent_all_yes=consent_all_yes,
+                consent_yes=consent_yes,
             )
             st.session_state["draft_log_id"] = log_id
         else:
             err = result.get("error") or "Unknown error"
             insert_generation_log(
                 session_id=session_id,
-                team=team_name,
+                participant_name=participant_name,
                 attempt_index=attempt_index,
                 prompt=prompt.strip(),
                 status="error",
                 metrics=metrics,
                 error_message=err,
-                group_size=group_size,
-                consent_all_yes=consent_all_yes,
+                consent_yes=consent_yes,
             )
             st.error(f"Generation failed: {err}")
 
@@ -1124,12 +1134,11 @@ if "draft_bytes" in st.session_state:
             metrics = st.session_state.get("draft_metrics", {}) or {}
 
             gallery_id = save_submission(
-                team=team_name or "Anonymous",
+                participant_name=participant_name or "Anonymous",
                 prompt=used_prompt,
                 img=img,
                 session_id=session_id,
-                group_size=group_size,
-                consent_all_yes=consent_all_yes,
+                consent_yes=consent_yes,
                 metrics=metrics,
             )
 
