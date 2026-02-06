@@ -53,7 +53,7 @@ You are welcome to discuss prompt ideas and generated images with someone else, 
 
 This is a voluntary workshop activity; you can stop at any time without negative consequences.
 
-Your prompts will be collected anonymously. Please do not include real names, emails, faces, or identifiable locations in your prompts.
+Your prompts (included those that are discarded) will be collected anonymously. Please do not include real names in your prompts.
 
 The workshop includes a research component conducted by Jenna Pfeifer, PhD candidate, Dr.ir. Yke Bauke Eisma, Dr. D. Dodou, and Prof.dr.ir. Joost de Winter.  
 The aim of the research is to investigate how young people conceptualise and recognise loneliness.  
