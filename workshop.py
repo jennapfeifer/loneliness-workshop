@@ -53,7 +53,7 @@ The AI provider will not use your prompts for model training.
 
 This is a voluntary workshop activity; you can stop at any time without negative consequences.
 
-Your prompts (included those that are discarded) will be collected anonymously. Please do not include real names in your prompts.
+Your prompts (including those that are discarded) will be collected anonymously. Please do not include real names in your prompts.
 
 The workshop includes a research component conducted by Jenna Pfeifer, PhD candidate, Dr.ir. Yke Bauke Eisma, Dr. D. Dodou, and Prof.dr.ir. Joost de Winter.  
 The aim of the research is to investigate how young people conceptualise and recognise loneliness.  
@@ -1006,8 +1006,6 @@ if not st.session_state["setup_complete"]:
         index=0,
         key="consent_choice_person_1",
     )
-
-    st.caption("You can discuss ideas with others, but please submit individually using your own device.")
 
     if st.button("Continue"):
         if not anon_name.strip():
