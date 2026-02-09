@@ -36,7 +36,7 @@ Create photorealistic, everyday scenes of a young adult who might be lonely.
 Write in third person and describe the moment with a bit of context and a few observable details (e.g., posture, gaze, spacing, objects, lighting).  
 Candid documentary style, natural colors; no text/watermark.
 
-You can discuss prompt ideas and generated previews with others, but **please submit individually on your own device**.
+**Please submit individually on your own device**.
 
 You can choose to submit or discard each image. Only submitted images appear in the gallery.  
 Submit up to **2** images per person.
@@ -49,7 +49,7 @@ CONSENT_TEXT = """**Before you start**
 In this activity, you will enter prompts that are sent to an AI provider to generate images.  
 The AI provider will not use your prompts for model training.
 
-You are welcome to discuss prompt ideas and generated images with someone else, but **please submit your prompts and images individually on your own device**.
+**Please submit your prompts and images individually on your own device**.
 
 This is a voluntary workshop activity; you can stop at any time without negative consequences.
 
