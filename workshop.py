@@ -134,15 +134,20 @@ def init_db_once() -> bool:
                 conn.execute(f"ALTER TABLE gallery ADD COLUMN {ddl}")
 
         add_gallery_col("session_id", "session_id TEXT")
-        add_gallery_col("group_size", "group_size INTEGER")          # kept (always 1)
-        add_gallery_col("consent_all_yes", "consent_all_yes INTEGER") # kept (per-person yes/no)
+        add_gallery_col("group_size", "group_size INTEGER")           # kept (always 1)
+        add_gallery_col("consent_all_yes", "consent_all_yes INTEGER")  # kept (per-person yes/no)
 
         add_gallery_col("model_name", "model_name TEXT")
         add_gallery_col("latency_ms", "latency_ms REAL")
         add_gallery_col("queue_wait_ms", "queue_wait_ms REAL")
         add_gallery_col("total_time_ms", "total_time_ms REAL")
+
         add_gallery_col("prompt_tokens", "prompt_tokens INTEGER")
         add_gallery_col("candidates_tokens", "candidates_tokens INTEGER")
+        # NEW: store extra usage counts that explain total != prompt + candidates
+        add_gallery_col("tool_use_prompt_tokens", "tool_use_prompt_tokens INTEGER")
+        add_gallery_col("thoughts_tokens", "thoughts_tokens INTEGER")
+
         add_gallery_col("total_tokens", "total_tokens INTEGER")
         add_gallery_col("prompt_chars", "prompt_chars INTEGER")
         add_gallery_col("prompt_words", "prompt_words INTEGER")
@@ -188,7 +193,10 @@ def init_db_once() -> bool:
 
                 prompt_tokens INTEGER,
                 candidates_tokens INTEGER,
+                tool_use_prompt_tokens INTEGER,  -- NEW
+                thoughts_tokens INTEGER,         -- NEW
                 total_tokens INTEGER,
+
                 prompt_chars INTEGER,
                 prompt_words INTEGER,
                 image_bytes INTEGER,
@@ -206,6 +214,16 @@ def init_db_once() -> bool:
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(generation_log)")]
         if "participant_name" not in cols:
             conn.execute("ALTER TABLE generation_log ADD COLUMN participant_name TEXT")
+
+        # NEW: migrations for older DBs (in case generation_log existed already)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(generation_log)")]
+
+        def add_genlog_col(name: str, ddl: str):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE generation_log ADD COLUMN {ddl}")
+
+        add_genlog_col("tool_use_prompt_tokens", "tool_use_prompt_tokens INTEGER")
+        add_genlog_col("thoughts_tokens", "thoughts_tokens INTEGER")
 
         # backfill participant_name from team_name if needed
         conn.execute(
@@ -316,23 +334,56 @@ def _get_thread_client(api_key: str):
     return _thread_local.client
 
 
+def _pick(d: dict, *keys):
+    """Pick the first present non-None value. IMPORTANT: preserves 0 values."""
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+
 def _extract_usage_tokens(response) -> Dict[str, Optional[int]]:
+    """
+    Extract token counts from Gemini usage metadata.
+
+    Includes:
+      - prompt_tokens
+      - candidates_tokens
+      - tool_use_prompt_tokens
+      - thoughts_tokens
+      - total_tokens
+
+    Uses non-None fallback logic so 0 isn't accidentally treated as missing.
+    """
     usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
     if usage is None:
-        return {"prompt_tokens": None, "candidates_tokens": None, "total_tokens": None}
+        return {
+            "prompt_tokens": None,
+            "candidates_tokens": None,
+            "tool_use_prompt_tokens": None,
+            "thoughts_tokens": None,
+            "total_tokens": None,
+        }
 
     if isinstance(usage, dict):
         return {
-            "prompt_tokens": usage.get("prompt_token_count") or usage.get("promptTokens") or usage.get("prompt_tokens"),
-            "candidates_tokens": usage.get("candidates_token_count")
-            or usage.get("candidatesTokens")
-            or usage.get("candidates_tokens"),
-            "total_tokens": usage.get("total_token_count") or usage.get("totalTokens") or usage.get("total_tokens"),
+            "prompt_tokens": _pick(usage, "prompt_token_count", "promptTokenCount", "promptTokens", "prompt_tokens"),
+            "candidates_tokens": _pick(
+                usage, "candidates_token_count", "candidatesTokenCount", "candidatesTokens", "candidates_tokens"
+            ),
+            "tool_use_prompt_tokens": _pick(
+                usage, "tool_use_prompt_token_count", "toolUsePromptTokenCount", "tool_use_prompt_tokens"
+            ),
+            "thoughts_tokens": _pick(usage, "thoughts_token_count", "thoughtsTokenCount", "thoughts_tokens"),
+            "total_tokens": _pick(usage, "total_token_count", "totalTokenCount", "totalTokens", "total_tokens"),
         }
 
+    # object-style usage metadata
     return {
         "prompt_tokens": getattr(usage, "prompt_token_count", None),
         "candidates_tokens": getattr(usage, "candidates_token_count", None),
+        "tool_use_prompt_tokens": getattr(usage, "tool_use_prompt_token_count", None),
+        "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
         "total_tokens": getattr(usage, "total_token_count", None),
     }
 
@@ -375,7 +426,18 @@ def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> Dict[str, A
     api_end = time.perf_counter()
     sem.release()
 
-    usage = _extract_usage_tokens(response) if response is not None else {"prompt_tokens": None, "candidates_tokens": None, "total_tokens": None}
+    usage = (
+        _extract_usage_tokens(response)
+        if response is not None
+        else {
+            "prompt_tokens": None,
+            "candidates_tokens": None,
+            "tool_use_prompt_tokens": None,
+            "thoughts_tokens": None,
+            "total_tokens": None,
+        }
+    )
+
     prompt_chars = len(prompt or "")
     prompt_words = len((prompt or "").split())
 
@@ -386,6 +448,8 @@ def _generate_image_bytes_with_metrics(prompt: str, api_key: str) -> Dict[str, A
         "total_time_ms": (api_end - t0) * 1000.0,
         "prompt_tokens": usage.get("prompt_tokens"),
         "candidates_tokens": usage.get("candidates_tokens"),
+        "tool_use_prompt_tokens": usage.get("tool_use_prompt_tokens"),  # NEW
+        "thoughts_tokens": usage.get("thoughts_tokens"),                # NEW
         "total_tokens": usage.get("total_tokens"),
         "prompt_chars": prompt_chars,
         "prompt_words": prompt_words,
@@ -426,14 +490,14 @@ def insert_generation_log(
             INSERT INTO generation_log (
                 session_id, team_name, participant_name, attempt_index, prompt, status,
                 model_name, latency_ms, queue_wait_ms, total_time_ms, decision_time_ms,
-                prompt_tokens, candidates_tokens, total_tokens,
+                prompt_tokens, candidates_tokens, tool_use_prompt_tokens, thoughts_tokens, total_tokens,
                 prompt_chars, prompt_words, image_bytes,
                 error_message, gallery_id,
                 group_size, consent_all_yes
             )
             VALUES (?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, NULL,
-                    ?, ?, ?,
+                    ?, ?, ?, ?, ?,
                     ?, ?, ?,
                     ?, NULL,
                     ?, ?)
@@ -451,6 +515,8 @@ def insert_generation_log(
                 metrics.get("total_time_ms"),
                 metrics.get("prompt_tokens"),
                 metrics.get("candidates_tokens"),
+                metrics.get("tool_use_prompt_tokens"),  # NEW
+                metrics.get("thoughts_tokens"),          # NEW
                 metrics.get("total_tokens"),
                 metrics.get("prompt_chars"),
                 metrics.get("prompt_words"),
@@ -510,7 +576,7 @@ def save_submission(
                 host_cluster, host_rank,
                 session_id, group_size, consent_all_yes,
                 model_name, latency_ms, queue_wait_ms, total_time_ms,
-                prompt_tokens, candidates_tokens, total_tokens,
+                prompt_tokens, candidates_tokens, tool_use_prompt_tokens, thoughts_tokens, total_tokens,
                 prompt_chars, prompt_words, image_bytes
             )
             VALUES (
@@ -518,7 +584,7 @@ def save_submission(
                 'Unsorted', NULL,
                 ?, ?, ?,
                 ?, ?, ?, ?,
-                ?, ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?, ?
             )
             """,
@@ -536,6 +602,8 @@ def save_submission(
                 metrics.get("total_time_ms"),
                 metrics.get("prompt_tokens"),
                 metrics.get("candidates_tokens"),
+                metrics.get("tool_use_prompt_tokens"),  # NEW
+                metrics.get("thoughts_tokens"),          # NEW
                 metrics.get("total_tokens"),
                 metrics.get("prompt_chars"),
                 metrics.get("prompt_words"),
@@ -570,6 +638,8 @@ def get_gallery_meta(order_by: str = "curated") -> List[Dict[str, Any]]:
                     total_time_ms,
                     prompt_tokens,
                     candidates_tokens,
+                    tool_use_prompt_tokens,   -- NEW
+                    thoughts_tokens,          -- NEW
                     total_tokens,
                     prompt_chars,
                     prompt_words,
@@ -599,6 +669,8 @@ def get_gallery_meta(order_by: str = "curated") -> List[Dict[str, Any]]:
                     total_time_ms,
                     prompt_tokens,
                     candidates_tokens,
+                    tool_use_prompt_tokens,   -- NEW
+                    thoughts_tokens,          -- NEW
                     total_tokens,
                     prompt_chars,
                     prompt_words,
@@ -636,6 +708,8 @@ def get_generation_log_rows() -> List[Dict[str, Any]]:
                 decision_time_ms,
                 prompt_tokens,
                 candidates_tokens,
+                tool_use_prompt_tokens,   -- NEW
+                thoughts_tokens,          -- NEW
                 total_tokens,
                 prompt_chars,
                 prompt_words,
@@ -728,6 +802,8 @@ def export_gallery_csv_bytes() -> bytes:
         "total_time_ms",
         "prompt_tokens",
         "candidates_tokens",
+        "tool_use_prompt_tokens",  # NEW
+        "thoughts_tokens",         # NEW
         "total_tokens",
         "prompt_chars",
         "prompt_words",
