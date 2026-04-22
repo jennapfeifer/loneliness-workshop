@@ -206,7 +206,7 @@ python figures.py \
 │   ├── gallery_images/
 │   │   ├── 0001.png
 │   │   └── ...
-│   ├── qualtrics_export.xlsx
+│   ├── qualtrics_export.csv
 │   ├── prompts_coded_final.csv        ← final_majority_vote.csv from code_prompts.py
 │   └── images_coded_final.csv         ← final_majority_vote.csv from code_images.py
 ├── figures.py
@@ -222,7 +222,7 @@ python figures.py \
     --prompt_csv  Data/prompts_coded_final.csv \
     --image_csv   Data/images_coded_final.csv \
     --image_dir   Data/gallery_images \
-    --survey_xlsx Data/qualtrics_export.xlsx \
+    --survey_xlsx Data/qualtrics_export.csv \
     --out_dir     figures_pub
 ```
 
