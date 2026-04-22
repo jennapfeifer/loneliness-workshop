@@ -1,4 +1,4 @@
-#Research repository for "Synthetic photo-elicitation with text-to-image AI: A workshop method for discussing youth loneliness"
+# Research repository for "Synthetic photo-elicitation with text-to-image AI: A workshop method for discussing youth loneliness"
 
 Code and analysis for the paper *Synthetic photo-elicitation with text-to-image AI: A workshop method for discussing youth loneliness*. The repository covers the full pipeline from the live Streamlit workshop application through qualitative coding of prompts and images to the final publication figures.
 
