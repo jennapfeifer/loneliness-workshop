@@ -22,9 +22,9 @@ Code and analysis for the paper *Synthetic photo-elicitation with text-to-image 
 
 **`codebook_images.md`** defines what to code in the *generated images*. It contains 23 binary codes organised into five sections: setting and environment (A), social configuration (B), visual cues for loneliness (C), AI default tropes (D), and image–prompt adequacy (E). The coder (Gemini vision) looks at each image and marks what is literally, visually present — it is about what the model *produced*.
 
-**`TextAnalysis/codebook_prompts.md`** defines what to code in the *text prompts*. It contains 25 binary codes covering visual and environmental cues (A), social and relational cues (B), AI stereotypes and tropes (C), prompt characteristics (D), and researcher-added inductive codes (E). The coder (Gemini text) reads each participant's written prompt and marks which themes and cues are present — it is about what participants *intended*.
+**`codebook_prompts.md`** defines what to code in the *text prompts*. It contains 25 binary codes covering visual and environmental cues (A), social and relational cues (B), AI stereotypes and tropes (C), prompt characteristics (D), and researcher-added inductive codes (E). The coder (Gemini text) reads each participant's written prompt and marks which themes and cues are present — it is about what participants *intended*.
 
-**`TextAnalysis/coding_prompt_prompts.md`** is not a codebook. It is the system prompt passed to Gemini when running `code_prompts.py` — the instructions that tell the model how to apply `codebook_prompts.md`: code only what is explicitly stated, when in doubt code 0, return a CSV with one row per prompt. The equivalent instructions for image coding are embedded directly in `code_images.py`.
+**`coding_prompt_prompts.md`** is not a codebook. It is the system prompt passed to Gemini when running `code_prompts.py` — the instructions that tell the model how to apply `codebook_prompts.md`: code only what is explicitly stated, when in doubt code 0, return a CSV with one row per prompt. The equivalent instructions for image coding are embedded directly in `code_images.py`.
 
 ---
 
@@ -195,7 +195,7 @@ python figures.py \
 
 **To set up the data folder:**
 
-1. Download the shared `Data/` folder from the provided dropbox link
+1. Download the shared `Data/` folder from [Dropbox link]
 2. Place it in the root of this repository so the structure looks like:
 
 ```
@@ -206,15 +206,30 @@ python figures.py \
 │   ├── gallery_images/
 │   │   ├── 0001.png
 │   │   └── ...
-│   └── qualtrics_export.xlsx
+│   ├── qualtrics_export.xlsx
+│   ├── prompts_coded_final.csv        ← final_majority_vote.csv from code_prompts.py
+│   └── images_coded_final.csv         ← final_majority_vote.csv from code_images.py
 ├── figures.py
 ├── code_prompts.py
 └── ...
 ```
 
+When running `figures.py`, point `--prompt_csv` and `--image_csv` at these files:
+
+```bash
+python figures.py \
+    --log_csv     Data/generation_log.csv \
+    --prompt_csv  Data/prompts_coded_final.csv \
+    --image_csv   Data/images_coded_final.csv \
+    --image_dir   Data/gallery_images \
+    --survey_xlsx Data/qualtrics_export.xlsx \
+    --out_dir     figures_pub
+```
+
 If you do not have access to the Dropbox folder, contact j.pfeifer@tudelft.nl.
 
 Only consented data is used in analysis; `code_images.py` and `figures.py` filter automatically on `consent_all_yes`.
+
 
 ---
 
