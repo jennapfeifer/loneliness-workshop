@@ -193,7 +193,28 @@ python figures.py \
 
 ## Data
 
-Raw data (images, database, survey export) are not included in this repository. The `Data/` folder should be created locally and populated as described above. Only consented data is used in analysis; both `code_images.py` and `figures.py` filter automatically on `consent_all_yes`.
+**To set up the data folder:**
+
+1. Download the shared `Data/` folder from the provided dropbox link
+2. Place it in the root of this repository so the structure looks like:
+
+```
+.
+├── Data/
+│   ├── generation_log.csv
+│   ├── gallery_metadata.csv
+│   ├── gallery_images/
+│   │   ├── 0001.png
+│   │   └── ...
+│   └── qualtrics_export.xlsx
+├── figures.py
+├── code_prompts.py
+└── ...
+```
+
+If you do not have access to the Dropbox folder, contact j.pfeifer@tudelft.nl.
+
+Only consented data is used in analysis; `code_images.py` and `figures.py` filter automatically on `consent_all_yes`.
 
 ---
 
